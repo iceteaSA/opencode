@@ -173,7 +173,7 @@ function writableGlobal(info: Info) {
   return next
 }
 
-const layer = Layer.effect(
+export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const fs = yield* FSUtil.Service
@@ -697,5 +697,6 @@ export const node = LayerNode.make({
   layer: layer,
   deps: [FSUtil.node, Auth.node, Account.node, Env.node, Npm.node, httpClient],
 })
+export const defaultLayer = layer
 
 export * as Config from "./config"
