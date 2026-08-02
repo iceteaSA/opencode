@@ -58,6 +58,8 @@ const it = testEffectIsolatedShared(
       registerLocal: () => Effect.die("unexpected Messaging.registerLocal"),
       isLocal: () => Effect.die("unexpected Messaging.isLocal"),
       localSet: () => Effect.succeed([target]),
+      registerWakeHandler: () => Effect.void,
+      setWakePolicy: () => Effect.void,
     }),
   ).pipe(Layer.provide(Database.layerFromPath(":memory:"))),
 )
