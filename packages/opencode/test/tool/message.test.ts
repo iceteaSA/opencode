@@ -20,7 +20,6 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { ToolRegistry } from "@/tool/registry"
 import { Truncate } from "@/tool/truncate"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
-import type { PromptInput } from "../../src/session/prompt"
 
 import { MessageTool, renderMarker, writeMarker, escapeBody } from "../../src/tool/message"
 import type { TaskPromptOps } from "../../src/tool/task"
@@ -56,7 +55,11 @@ const root = LayerNode.group([
 const it = testEffect(LayerNode.compile(root, [[RuntimeFlags.node, RuntimeFlags.layer()]]))
 
 // Seed a session with one user message so writeMarker can derive agent/model.
-const seedSession = Effect.fn("MessageToolTest.seedSession")(function* (parentID?: SessionID, title = "chat") {
+const seedSession = Effect.fn("MessageToolTest.seedSession")(function* (
+  parentID?: SessionID,
+  title = "chat",
+  model: SessionV1.User["model"] = ref,
+) {
   const sessions = yield* Session.Service
   const chat = yield* sessions.create({ parentID, title, agent: "build" })
   yield* sessions.updateMessage({
@@ -64,20 +67,21 @@ const seedSession = Effect.fn("MessageToolTest.seedSession")(function* (parentID
     role: "user",
     sessionID: chat.id,
     agent: "build",
-    model: ref,
+    model,
     time: { created: Date.now() },
   })
   return chat
 })
 
-type CapturedPrompt = {
-  sessionID: string
-  parts: SessionV1.Part[]
-  model?: PromptInput["model"]
-  variant?: PromptInput["variant"]
-}
-
-function stubOps(record?: (input: CapturedPrompt) => void): TaskPromptOps {
+function stubOps(
+  record?: (input: {
+    sessionID: string
+    model?: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
+    variant?: string
+    agent?: string
+    parts: SessionV1.Part[]
+  }) => void,
+): TaskPromptOps {
   return {
     cancel: () => Effect.void,
     cancelRun: () => Effect.void,
@@ -86,9 +90,10 @@ function stubOps(record?: (input: CapturedPrompt) => void): TaskPromptOps {
       Effect.sync(() => {
         record?.({
           sessionID: input.sessionID,
-          parts: input.parts as SessionV1.Part[],
           model: input.model,
           variant: input.variant,
+          agent: input.agent,
+          parts: input.parts as SessionV1.Part[],
         })
         const id = MessageID.ascending()
         return {
@@ -212,73 +217,22 @@ describe("tool.message", () => {
 
   describe("MessageTool target=parent (Channel B / inject)", () => {
     it.instance(
-      "preserves the parent's latest model and variant when injecting a subagent message",
-      () =>
-        Effect.gen(function* () {
-          const sessions = yield* Session.Service
-          const parentModel = {
-            providerID: ProviderV2.ID.make("parent-provider"),
-            modelID: ModelV2.ID.make("parent-model"),
-            variant: "thinking",
-          }
-          const parent = yield* sessions.create({
-            title: "parent",
-            agent: "build",
-            model: {
-              providerID: parentModel.providerID,
-              id: parentModel.modelID,
-              variant: parentModel.variant,
-            },
-          })
-          yield* sessions.updateMessage({
-            id: MessageID.ascending(),
-            role: "user",
-            sessionID: parent.id,
-            agent: "build",
-            model: parentModel,
-            time: { created: Date.now() },
-          })
-          const child = yield* seedSession(parent.id, "child")
-          const tool = yield* MessageTool
-          const def = yield* tool.init()
-          const captured: CapturedPrompt[] = []
-
-          yield* def.execute(
-            { target: "parent", body: "keep-model", expect_reply: false },
-            {
-              sessionID: child.id,
-              messageID: MessageID.ascending(),
-              agent: "general",
-              abort: new AbortController().signal,
-              extra: { promptOps: stubOps((input) => captured.push(input)) },
-              messages: [],
-              metadata: () => Effect.void,
-              ask: () => Effect.void,
-            },
-          )
-
-          yield* Effect.sleep("100 millis")
-
-          const injected = captured.find((input) => input.sessionID === parent.id)
-          expect(injected?.model).toEqual({
-            providerID: parentModel.providerID,
-            modelID: parentModel.modelID,
-          })
-          expect(injected?.variant).toBe(parentModel.variant)
-        }),
-    )
-
-    it.instance(
       "fire-and-forget injects synthetic frame + visible ✉ marker into the parent",
       () =>
         Effect.gen(function* () {
           const sessions = yield* Session.Service
-          const parent = yield* seedSession(undefined, "parent")
+          const parent = yield* seedSession(undefined, "parent", { ...ref, variant: "high" })
           const child = yield* seedSession(parent.id, "child")
           const tool = yield* MessageTool
           const def = yield* tool.init()
 
-          const captured: { sessionID: string; parts: SessionV1.Part[] }[] = []
+          const captured: {
+            sessionID: string
+            model?: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
+            variant?: string
+            agent?: string
+            parts: SessionV1.Part[]
+          }[] = []
           const promptOps = stubOps((input) => captured.push(input))
 
           const result = yield* def.execute(
@@ -301,6 +255,9 @@ describe("tool.message", () => {
 
           const injected = captured.find((c) => c.sessionID === parent.id)
           expect(injected).toBeDefined()
+          expect(injected!.model).toEqual(ref)
+          expect(injected!.variant).toBe("high")
+          expect(injected!.agent).toBe("build")
           expect(injected!.parts).toHaveLength(2)
           const synthetic = injected!.parts.find((p) => p.type === "text" && p.synthetic) as
             | (SessionV1.TextPart & { synthetic: true })
