@@ -262,6 +262,8 @@ export type SessionsListOutput = {
         readonly patch: string
       }>
     }
+    readonly result?: { readonly [x: string]: JsonValue }
+    readonly contextMode?: "full" | "sparse"
   }>
   readonly cursor: { readonly previous?: string | null; readonly next?: string | null }
 }
@@ -324,6 +326,8 @@ export type SessionsCreateOutput = {
         readonly patch: string
       }>
     }
+    readonly result?: { readonly [x: string]: JsonValue }
+    readonly contextMode?: "full" | "sparse"
   }
 }["data"]
 
@@ -362,6 +366,8 @@ export type SessionsGetOutput = {
         readonly patch: string
       }>
     }
+    readonly result?: { readonly [x: string]: JsonValue }
+    readonly contextMode?: "full" | "sparse"
   }
 }["data"]
 
