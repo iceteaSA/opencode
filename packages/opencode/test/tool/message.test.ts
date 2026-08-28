@@ -398,10 +398,12 @@ describe("tool.message", () => {
       () =>
         Effect.gen(function* () {
           const messaging = yield* Messaging.Service
+          const sessions = yield* Session.Service
           const parent = yield* seedSession(undefined, "parent")
           const child = yield* seedSession(parent.id, "child")
           const tool = yield* MessageTool
           const def = yield* tool.init()
+          const childMessagesBefore = yield* sessions.messages({ sessionID: child.id })
 
           const result = yield* def.execute(
             { target: "subagent", task_id: child.id, body: "wake at the boundary" },
@@ -426,10 +428,8 @@ describe("tool.message", () => {
             fromSlug: "parent",
             body: "wake at the boundary",
           })
-          const markers = yield* collectMarkers(child.id)
-          expect(markers.find((m) => m.meta.peer === "parent")?.text).toBe(
-            "✉ Reply from parent: wake at the boundary",
-          )
+          const childMessagesAfter = yield* sessions.messages({ sessionID: child.id })
+          expect(childMessagesAfter).toHaveLength(childMessagesBefore.length)
         }),
     )
 
