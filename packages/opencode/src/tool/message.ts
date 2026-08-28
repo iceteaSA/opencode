@@ -22,7 +22,7 @@ export const Parameters = Schema.Struct({
     description: "When true (default) and target is 'parent', block until the parent replies or a timeout elapses",
   }),
   task_id: Schema.optional(Schema.String).annotate({
-    description: "Required when target is 'subagent': the task_id of the subagent awaiting your reply",
+    description: "Required when target is 'subagent': the task_id of the subagent you spawned",
   }),
 })
 
@@ -59,26 +59,66 @@ export const MessageTool = Tool.define<
       if (params.target === "subagent") {
         if (!params.task_id)
           return yield* Effect.fail(new Error('message(target:"subagent") requires task_id'))
-        const childID = SessionID.make(params.task_id)
-        yield* messaging
+        const childID = params.task_id.startsWith("ses_")
+          ? Option.some(SessionID.make(params.task_id))
+          : yield* messaging.resolveSlug(params.task_id)
+        if (Option.isNone(childID))
+          return yield* Effect.fail(new Error(`task_id ${params.task_id} does not resolve to a subagent`))
+
+        const replied = yield* messaging
           .reply({
-            childSessionID: childID,
+            childSessionID: childID.value,
             body: params.body,
             callerSessionID: ctx.sessionID,
           })
-          .pipe(
-            Effect.catchTag("Messaging.NotFoundError", () =>
-              Effect.fail(new Error(`No subagent is awaiting a reply for task_id ${params.task_id}`)),
-            ),
-          )
+          .pipe(Effect.as(true), Effect.catchTag("Messaging.NotFoundError", () => Effect.succeed(false)))
+
+        if (!replied) {
+          const child = yield* sessions.get(childID.value).pipe(Effect.option)
+          if (Option.isNone(child) || child.value.id === ctx.sessionID)
+            return yield* Effect.fail(new Error(`task_id ${params.task_id} is not a descendant of this session`))
+
+          let ancestorID = child.value.parentID
+          let authorized = false
+          // Bound the walk so corrupted parent links fail closed instead of looping forever.
+          for (let hop = 0; hop < 64; hop++) {
+            if (!ancestorID) break
+            if (ancestorID === ctx.sessionID) {
+              authorized = true
+              break
+            }
+            const ancestor = yield* sessions.get(ancestorID).pipe(Effect.option)
+            if (Option.isNone(ancestor)) break
+            ancestorID = ancestor.value.parentID
+          }
+          if (!authorized)
+            return yield* Effect.fail(new Error(`task_id ${params.task_id} is not a descendant of this session`))
+
+          yield* messaging
+            .enqueue({
+              target: childID.value,
+              from: ctx.sessionID,
+              fromSlug: "parent",
+              body: params.body,
+            })
+            .pipe(Effect.catchTag("Messaging.AbuseError", (e) => Effect.fail(new Error(e.detail))))
+        }
+
         // Visible "✉ Reply from parent" marker in the SUBAGENT transcript.
         // No parent-side echo: the message tool call already shows what was sent.
         // Best-effort: a marker write failure must not undo the delivered reply.
         yield* writeMarker(sessions, {
-          sessionID: childID,
+          sessionID: childID.value,
           peer: "parent",
           body: params.body,
         }).pipe(Effect.ignore)
+        if (!replied)
+          return {
+            title: "Queued message to subagent",
+            metadata: { target: params.target, expect_reply: false },
+            output:
+              "Message queued to the subagent's inbox; it will be read at the child's next turn boundary. An idle child wakes on its own only when dispatched with wake_on_message: true.",
+          }
         return {
           title: "Replied to subagent",
           metadata: { target: params.target, expect_reply: false },
