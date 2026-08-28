@@ -379,6 +379,19 @@ function compactionContext(context: string) {
   })
 }
 
+function chatHookOrder(order: string[]) {
+  return Layer.mock(Plugin.Service)({
+    trigger: <Name extends string, Input, Output>(name: Name, _input: Input, output: Output) =>
+      Effect.sync(() => {
+        if (name === "experimental.chat.system.transform") order.push("system")
+        if (name === "experimental.chat.messages.transform") order.push("messages")
+        return output
+      }),
+    list: () => Effect.succeed([]),
+    init: () => Effect.void,
+  })
+}
+
 describe("session.compaction.isOverflow", () => {
   it.live(
     "returns true when token count exceeds usable context",
@@ -874,6 +887,29 @@ describe("session.compaction.process", () => {
       expect(seen).toContain(SessionCompaction.Event.Compacted.type)
       expect(seen.filter((type) => type.startsWith("session.next."))).toEqual([])
     }),
+  )
+
+  itCompaction.instance(
+    "fires system transform before messages transform",
+    () => {
+      const order: string[] = []
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const msg = yield* createUserMessage(session.id, "hello")
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: msg.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        expect(result).toBe("continue")
+        expect(order).toEqual(["system", "messages"])
+      }).pipe(withCompaction({ plugin: chatHookOrder(order) }))
+    },
   )
 
   itCompaction.instance(
@@ -1401,8 +1437,8 @@ describe("session.compaction.process", () => {
         })
 
         const captured = JSON.stringify(messages)
-        expect(messages).toHaveLength(1)
-        expect(messages[0]?.role).toBe("user")
+        expect(messages).toHaveLength(2)
+        expect(messages.at(-1)?.role).toBe("user")
         expect(captured).toContain("Here is the conversation so far:")
         expect(captured).toContain("<conversation>")
         expect(captured.indexOf("[User]: older context")).toBeLessThan(
@@ -1567,8 +1603,8 @@ describe("session.compaction.process", () => {
         expect(parent).toBeTruthy()
         yield* SessionCompaction.use.process({ parentID: parent!, messages: msgs, sessionID: session.id, auto: false })
 
-        expect(captured).toHaveLength(1)
-        expect(captured[0]?.role).toBe("user")
+        expect(captured).toHaveLength(3)
+        expect(captured.at(-1)?.role).toBe("user")
         expect(JSON.stringify(captured)).toContain('[Assistant tool call]: read({\\"filePath\\":\\"src/index.ts\\"})')
         expect(JSON.stringify(captured)).toContain("[Tool result]: file contents")
         expect(JSON.stringify(captured)).not.toContain('\\"role\\":\\"assistant\\"')
