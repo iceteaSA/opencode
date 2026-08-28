@@ -1,4 +1,4 @@
-import { Effect, Schema, Option } from "effect"
+import { Effect, Schema } from "effect"
 import * as Tool from "./tool"
 import { Interrupt } from "../session/interrupt"
 import { Session } from "@/session/session"
@@ -7,6 +7,7 @@ import { Permission } from "@/permission"
 import { Agent } from "@/agent/agent"
 import { Messaging } from "@/messaging"
 import { SessionID } from "../session/schema"
+import { SubagentTarget } from "./subagent-target"
 import STEER_DESCRIPTION from "./task-steer.txt"
 import CANCEL_DESCRIPTION from "./task-cancel.txt"
 import ABORT_DESCRIPTION from "./task-abort.txt"
@@ -32,27 +33,10 @@ const resolveChild = (
   callerSessionID: SessionID,
 ) =>
   Effect.gen(function* () {
-    const childID = taskId.startsWith("ses_") ? Option.some(SessionID.make(taskId)) : yield* messaging.resolveSlug(taskId)
-    if (Option.isNone(childID)) return { kind: "not_found" as const }
-
-    // Slugs are process-global, so resolution must not bypass the descendant authorization below.
-    const child = yield* sessions.get(childID.value).pipe(Effect.option)
-    if (Option.isNone(child) || child.value.id === callerSessionID) return { kind: "not_found" as const }
-
-    let ancestorID = child.value.parentID
-    // Parent links should be acyclic, but corrupted data must not trap an interrupt request forever.
-    for (let hop = 0; hop < 64; hop++) {
-      if (!ancestorID) return { kind: "not_found" as const }
-      if (ancestorID === callerSessionID) {
-        const job = yield* background.get(childID.value)
-        const running = !!job && job.status === "running"
-        return { kind: "resolved" as const, childID: childID.value, running }
-      }
-      const ancestor = yield* sessions.get(ancestorID).pipe(Effect.option)
-      if (Option.isNone(ancestor)) return { kind: "not_found" as const }
-      ancestorID = ancestor.value.parentID
-    }
-    return { kind: "not_found" as const }
+    const resolved = yield* SubagentTarget.resolve(sessions, messaging, taskId, callerSessionID)
+    if (resolved.kind === "not_found") return resolved
+    const job = yield* background.get(resolved.childID)
+    return { ...resolved, running: !!job && job.status === "running" }
   })
 
 export const TaskSteerTool = Tool.define<
