@@ -7,6 +7,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { MessageID, PartID, SessionID } from "../session/schema"
 import { MessageV2 } from "../session/message-v2"
 import { Marker } from "../session/marker"
+import { SubagentTarget } from "./subagent-target"
 import type { TaskPromptOps } from "./task"
 import DESCRIPTION from "./message.txt"
 
@@ -59,44 +60,23 @@ export const MessageTool = Tool.define<
       if (params.target === "subagent") {
         if (!params.task_id)
           return yield* Effect.fail(new Error('message(target:"subagent") requires task_id'))
-        const childID = params.task_id.startsWith("ses_")
-          ? Option.some(SessionID.make(params.task_id))
-          : yield* messaging.resolveSlug(params.task_id)
-        if (Option.isNone(childID))
-          return yield* Effect.fail(new Error(`task_id ${params.task_id} does not resolve to a subagent`))
+        const resolved = yield* SubagentTarget.resolve(sessions, messaging, params.task_id, ctx.sessionID)
+        if (resolved.kind === "not_found")
+          return yield* Effect.fail(new Error(`task_id ${params.task_id} is not a descendant of this session`))
+        const childID = resolved.childID
 
         const replied = yield* messaging
           .reply({
-            childSessionID: childID.value,
+            childSessionID: childID,
             body: params.body,
             callerSessionID: ctx.sessionID,
           })
           .pipe(Effect.as(true), Effect.catchTag("Messaging.NotFoundError", () => Effect.succeed(false)))
 
         if (!replied) {
-          const child = yield* sessions.get(childID.value).pipe(Effect.option)
-          if (Option.isNone(child) || child.value.id === ctx.sessionID)
-            return yield* Effect.fail(new Error(`task_id ${params.task_id} is not a descendant of this session`))
-
-          let ancestorID = child.value.parentID
-          let authorized = false
-          // Bound the walk so corrupted parent links fail closed instead of looping forever.
-          for (let hop = 0; hop < 64; hop++) {
-            if (!ancestorID) break
-            if (ancestorID === ctx.sessionID) {
-              authorized = true
-              break
-            }
-            const ancestor = yield* sessions.get(ancestorID).pipe(Effect.option)
-            if (Option.isNone(ancestor)) break
-            ancestorID = ancestor.value.parentID
-          }
-          if (!authorized)
-            return yield* Effect.fail(new Error(`task_id ${params.task_id} is not a descendant of this session`))
-
           yield* messaging
             .enqueue({
-              target: childID.value,
+              target: childID,
               from: ctx.sessionID,
               fromSlug: "parent",
               body: params.body,
@@ -109,7 +89,7 @@ export const MessageTool = Tool.define<
           // No parent-side echo: the message tool call already shows what was sent.
           // Best-effort: a marker write failure must not undo the delivered reply.
           yield* writeMarker(sessions, {
-            sessionID: childID.value,
+            sessionID: childID,
             peer: "parent",
             body: params.body,
           }).pipe(Effect.ignore)

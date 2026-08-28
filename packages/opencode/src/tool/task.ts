@@ -575,6 +575,7 @@ export const TaskTool = Tool.define(
               providerID: lastUser.model.providerID,
               modelID: lastUser.model.modelID,
             },
+            // Parent-session injection prefers the parent's own variant, falling back to the dispatch variant when absent.
             variant: lastUser.model.variant ?? variant,
             parts: [
               {

@@ -392,7 +392,7 @@ describe("tool.message", () => {
     )
   })
 
-  describe("MessageTool target=subagent (parent replies)", () => {
+  describe("MessageTool target=subagent", () => {
     it.instance(
       "queues a message to an idle descendant inbox when no reply is parked",
       () =>
