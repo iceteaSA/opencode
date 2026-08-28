@@ -104,14 +104,16 @@ export const MessageTool = Tool.define<
             .pipe(Effect.catchTag("Messaging.AbuseError", (e) => Effect.fail(new Error(e.detail))))
         }
 
-        // Visible "✉ Reply from parent" marker in the SUBAGENT transcript.
-        // No parent-side echo: the message tool call already shows what was sent.
-        // Best-effort: a marker write failure must not undo the delivered reply.
-        yield* writeMarker(sessions, {
-          sessionID: childID.value,
-          peer: "parent",
-          body: params.body,
-        }).pipe(Effect.ignore)
+        if (replied) {
+          // Visible "✉ Reply from parent" marker in the SUBAGENT transcript.
+          // No parent-side echo: the message tool call already shows what was sent.
+          // Best-effort: a marker write failure must not undo the delivered reply.
+          yield* writeMarker(sessions, {
+            sessionID: childID.value,
+            peer: "parent",
+            body: params.body,
+          }).pipe(Effect.ignore)
+        }
         if (!replied)
           return {
             title: "Queued message to subagent",
