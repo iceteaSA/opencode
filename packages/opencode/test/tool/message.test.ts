@@ -394,6 +394,115 @@ describe("tool.message", () => {
 
   describe("MessageTool target=subagent (parent replies)", () => {
     it.instance(
+      "queues a message to an idle descendant inbox when no reply is parked",
+      () =>
+        Effect.gen(function* () {
+          const messaging = yield* Messaging.Service
+          const parent = yield* seedSession(undefined, "parent")
+          const child = yield* seedSession(parent.id, "child")
+          const tool = yield* MessageTool
+          const def = yield* tool.init()
+
+          const result = yield* def.execute(
+            { target: "subagent", task_id: child.id, body: "wake at the boundary" },
+            {
+              sessionID: parent.id,
+              messageID: MessageID.ascending(),
+              agent: "build",
+              abort: new AbortController().signal,
+              extra: {},
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.void,
+            },
+          )
+
+          expect(result.output).toContain("queued to the subagent's inbox")
+          expect(result.output).toContain("next turn boundary")
+          const inbox = yield* messaging.drain(child.id)
+          expect(inbox).toHaveLength(1)
+          expect(inbox[0]).toMatchObject({
+            from: parent.id,
+            fromSlug: "parent",
+            body: "wake at the boundary",
+          })
+          const markers = yield* collectMarkers(child.id)
+          expect(markers.find((m) => m.meta.peer === "parent")?.text).toBe(
+            "✉ Reply from parent: wake at the boundary",
+          )
+        }),
+    )
+
+    it.instance(
+      "rejects a non-descendant target without enqueuing anything",
+      () =>
+        Effect.gen(function* () {
+          const messaging = yield* Messaging.Service
+          const parent = yield* seedSession(undefined, "parent")
+          const outsider = yield* seedSession(undefined, "outsider")
+          const tool = yield* MessageTool
+          const def = yield* tool.init()
+
+          const exit = yield* def
+            .execute(
+              { target: "subagent", task_id: outsider.id, body: "do not deliver" },
+              {
+                sessionID: parent.id,
+                messageID: MessageID.ascending(),
+                agent: "build",
+                abort: new AbortController().signal,
+                extra: {},
+                messages: [],
+                metadata: () => Effect.void,
+                ask: () => Effect.void,
+              },
+            )
+            .pipe(Effect.exit)
+
+          expect(Exit.isFailure(exit)).toBe(true)
+          if (Exit.isFailure(exit)) {
+            const err = Cause.squash(exit.cause)
+            expect(String(err)).toContain(`task_id ${outsider.id}`)
+            expect(String(err)).toContain("not a descendant")
+          }
+          expect(yield* messaging.drain(outsider.id)).toEqual([])
+        }),
+    )
+
+    it.instance(
+      "queues a slug-resolved grandchild through the full ancestry chain",
+      () =>
+        Effect.gen(function* () {
+          const messaging = yield* Messaging.Service
+          const parent = yield* seedSession(undefined, "parent")
+          const child = yield* seedSession(parent.id, "child")
+          const grandchild = yield* seedSession(child.id, "grandchild")
+          yield* messaging.registerSlug("grandchild", grandchild.id)
+          const tool = yield* MessageTool
+          const def = yield* tool.init()
+
+          const result = yield* def.execute(
+            { target: "subagent", task_id: "grandchild", body: "reach depth two" },
+            {
+              sessionID: parent.id,
+              messageID: MessageID.ascending(),
+              agent: "build",
+              abort: new AbortController().signal,
+              extra: {},
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.void,
+            },
+          )
+
+          expect(result.output).toContain("queued to the subagent's inbox")
+          expect(yield* messaging.drain(grandchild.id)).toMatchObject([
+            { from: parent.id, fromSlug: "parent", body: "reach depth two" },
+          ])
+        }),
+    )
+
+    it.instance(
       "delivers reply to a parked subagent and writes the inbound marker to the subagent",
       () =>
         Effect.gen(function* () {
@@ -482,7 +591,7 @@ describe("tool.message", () => {
           expect(Exit.isFailure(exit)).toBe(true)
           if (Exit.isFailure(exit)) {
             const err = Cause.squash(exit.cause)
-            expect(String(err)).toContain("No subagent is awaiting a reply")
+            expect(String(err)).toContain("is not a descendant")
           }
         }),
     )
