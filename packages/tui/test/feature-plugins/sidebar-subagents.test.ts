@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import type { Part } from "@opencode-ai/sdk/v2"
-import { activeSubagents, deriveSubagents } from "../../src/feature-plugins/sidebar/subagents"
+import { activeSubagents, deriveSubagents, latestSubagentTPS } from "../../src/feature-plugins/sidebar/subagents"
 
 const messages = [{ id: "message-1" }]
 const noStatus = () => undefined
@@ -204,5 +204,60 @@ describe("sidebar subagents", () => {
         },
       ] as unknown as Part[], busyStatus),
     ).toEqual([{ description: "Background research", status: "active", session_id: "child-busy" }])
+  })
+})
+
+describe("latestSubagentTPS", () => {
+  const user = (created: number) => ({ role: "user" as const, time: { created } })
+  const assistant = (input: {
+    finish?: string
+    output: number
+    reasoning?: number
+    created: number
+    firstToken?: number
+    completed?: number
+  }) => ({
+    role: "assistant" as const,
+    finish: input.finish,
+    tokens: { output: input.output, reasoning: input.reasoning ?? 0 },
+    time: { created: input.created, firstToken: input.firstToken, completed: input.completed },
+  })
+
+  test("returns undefined for no messages", () => {
+    expect(latestSubagentTPS([])).toBeUndefined()
+  })
+
+  test("returns undefined when only user messages exist", () => {
+    expect(latestSubagentTPS([user(1), user(2)])).toBeUndefined()
+  })
+
+  test("falls back to the newest completed turn while the newest is in flight", () => {
+    const messages = [
+      user(0),
+      assistant({ finish: "stop", output: 500, reasoning: 100, created: 100, firstToken: 1000, completed: 2000 }),
+      assistant({ output: 10, created: 3000, firstToken: 3100 }),
+    ]
+    expect(latestSubagentTPS(messages)?.rate).toBe(600)
+  })
+
+  test("uses the newest completed turn, not the highest rate", () => {
+    const messages = [
+      assistant({ finish: "stop", output: 1000, created: 100, firstToken: 200, completed: 1200 }),
+      assistant({ finish: "stop", output: 150, created: 5000, firstToken: 5100, completed: 6100 }),
+    ]
+    expect(latestSubagentTPS(messages)?.rate).toBe(150)
+  })
+
+  test("counts tool-call turns", () => {
+    const messages = [assistant({ finish: "tool-calls", output: 300, created: 100, firstToken: 200, completed: 700 })]
+    expect(latestSubagentTPS(messages)?.rate).toBe(600)
+  })
+
+  test("skips errored turns and falls back to the previous completed one", () => {
+    const messages = [
+      assistant({ finish: "stop", output: 200, created: 100, firstToken: 200, completed: 1200 }),
+      assistant({ finish: "error", output: 999, created: 5000, firstToken: 5100, completed: 6100 }),
+    ]
+    expect(latestSubagentTPS(messages)?.rate).toBe(200)
   })
 })
