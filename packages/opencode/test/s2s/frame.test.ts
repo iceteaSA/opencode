@@ -337,9 +337,11 @@ describe("s2s frame: cross-session <external-context> in the drain (Task 6)", ()
           })
         }
       }),
-    // Real prompt.loop turn + drain; keep above bun's 5000ms default so batch
-    // contention can't false-fail it.
-    15000,
+    // Real prompt.loop turn + drain, so the runtime is dominated by layer build
+    // and a live loop rather than a fixed wait: 9-15s on an idle machine, more
+    // under parallel load. The cap catches a hang; it is not a budget, so keep
+    // it well clear of the observed range.
+    30000,
   )
 
   it.instance(
@@ -389,7 +391,7 @@ describe("s2s frame: cross-session <external-context> in the drain (Task 6)", ()
         // The body still surfaces.
         expect(frame).toContain("payload")
       }),
-    15000,
+    30000,
   )
 
   it.instance(
@@ -443,7 +445,7 @@ describe("s2s frame: cross-session <external-context> in the drain (Task 6)", ()
           expect(inboxMarker.text).toContain("in-proc-payload")
         }
       }),
-    // Real prompt.loop turn + drain; keep above the 5000ms default.
-    15000,
+    // Real prompt.loop turn + drain; see the cap note above.
+    30000,
   )
 })
