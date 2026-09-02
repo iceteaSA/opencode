@@ -1,6 +1,7 @@
 import type { Part, SessionStatus } from "@opencode-ai/sdk/v2"
 import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui"
 import type { BuiltinTuiPlugin } from "../builtins"
+import { formatTPS, getMessageTPS, type TPSResult } from "@opencode-ai/core/session/tokens"
 import { createMemo, For, Show } from "solid-js"
 
 const id = "internal:sidebar-subagents"
@@ -68,6 +69,28 @@ export function activeSubagents(
   })
 }
 
+type SubagentTPSMessage =
+  | { role: "user" }
+  | {
+      role: "assistant"
+      summary?: boolean
+      finish?: string | null
+      tokens: { output: number; reasoning: number }
+      time: { created: number; firstToken?: number; completed?: number }
+    }
+
+export function latestSubagentTPS(messages: ReadonlyArray<SubagentTPSMessage>): TPSResult | undefined {
+  // The newest assistant message is usually still in flight (no finish yet), so the
+  // live rate comes from the newest turn that actually completed.
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]!
+    if (message.role !== "assistant") continue
+    const tps = getMessageTPS(message)
+    if (tps) return tps
+  }
+  return undefined
+}
+
 function View(props: { api: TuiPluginApi; session_id: string }) {
   const theme = () => props.api.theme.current
   const list = createMemo(() =>
@@ -103,6 +126,9 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
             const navigate = item.session_id
               ? () => props.api.route.navigate("session", { sessionID: item.session_id })
               : undefined
+            const tps = createMemo(() =>
+              item.session_id ? latestSubagentTPS(props.api.state.session.messages(item.session_id)) : undefined,
+            )
             return (
               <box flexDirection="row" gap={1} onMouseUp={navigate}>
                 <text flexShrink={0} style={{ fg: statusColor(item.status) }}>
@@ -110,6 +136,9 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
                 </text>
                 <text fg={theme().text} wrapMode="word">
                   {item.description} <span style={{ fg: theme().textMuted }}>{statusLabel(item.status)}</span>
+                  <Show when={tps()}>
+                    <span style={{ fg: theme().textMuted }}> · {formatTPS(tps()!)}</span>
+                  </Show>
                 </text>
               </box>
             )
