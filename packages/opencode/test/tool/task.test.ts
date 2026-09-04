@@ -111,6 +111,7 @@ function stubOps(opts?: {
 }): TaskPromptOps {
   return {
     cancel: () => Effect.void,
+    cancelRun: () => Effect.void,
     resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
     prompt: (input) =>
       Effect.sync(() => {
@@ -283,6 +284,7 @@ describe("tool.task", () => {
           prompt: "look into the cache key path",
           subagent_type: "general",
           task_id: child.id,
+          resume: true,
         },
         {
           sessionID: chat.id,
@@ -424,9 +426,10 @@ describe("tool.task", () => {
       const result = yield* def.execute(
         {
           description: "continue investigation",
-          prompt: "continue the investigation without returning a structured result",
-          subagent_type: "general",
-          task_id: child.id,
+           prompt: "continue the investigation without returning a structured result",
+           subagent_type: "general",
+           task_id: child.id,
+           resume: true,
         },
         {
           sessionID: chat.id,
@@ -444,6 +447,146 @@ describe("tool.task", () => {
       expect(result.output).not.toContain("<task_return>")
       const event = yield* Deferred.await(captured)
       expect(event.data.result).toBeUndefined()
+    }),
+  )
+
+  it.instance("uses a fallback when a foreground task error string is blank", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      let error = ""
+      const fakeBackground: BackgroundJob.Interface = {
+        list: () => Effect.succeed([]),
+        get: () => Effect.succeed(undefined),
+        start: (input) =>
+          Effect.succeed({
+            id: input.id ?? "task",
+            type: input.type,
+            title: input.title,
+            status: "running",
+            started_at: 0,
+            metadata: input.metadata,
+          }),
+        extend: () => Effect.succeed(false),
+        wait: () =>
+          Effect.succeed({
+            timedOut: false,
+            info: { id: "task", type: "task", status: "error", started_at: 0, error },
+          }),
+        waitForPromotion: () => Effect.never,
+        message: () => Effect.succeed(undefined),
+        waitForMessage: () => Effect.never,
+        promote: () => Effect.succeed(undefined),
+        cancel: () => Effect.succeed(undefined),
+      }
+      const task = yield* TaskTool.pipe(Effect.provideService(BackgroundJob.Service, fakeBackground))
+      const def = yield* task.init()
+      const execute = () =>
+        def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps() },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+      const blank = yield* execute().pipe(Effect.exit)
+      expect(Exit.isFailure(blank)).toBe(true)
+      if (Exit.isFailure(blank)) {
+        const failure = Cause.squash(blank.cause)
+        expect(failure).toBeInstanceOf(Error)
+        if (failure instanceof Error) expect(failure.message).toBe("Task failed")
+      }
+
+      error = "real task error"
+      const real = yield* execute().pipe(Effect.exit)
+      expect(Exit.isFailure(real)).toBe(true)
+      if (Exit.isFailure(real)) {
+        const failure = Cause.squash(real.cause)
+        expect(failure).toBeInstanceOf(Error)
+        if (failure instanceof Error) expect(failure.message).toBe("real task error")
+      }
+    }),
+  )
+
+  it.instance("persists dispatch metadata on the child session", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const promptOps = stubOps()
+
+      const result = yield* def.execute(
+        {
+          description: "review code",
+          prompt: "review the code",
+          subagent_type: "general",
+          metadata: { domain: "code-review", score_tap: true },
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      const child = yield* sessions.get(result.metadata.sessionId)
+      expect(child.metadata).toEqual({ domain: "code-review", score_tap: true })
+    }),
+  )
+
+  it.instance("merges dispatch metadata into an existing child session on resume", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const child = yield* sessions.create({
+        parentID: chat.id,
+        title: "resumed child",
+        agent: "general",
+        metadata: { domain: "code-review", round: 1 },
+      })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const promptOps = stubOps()
+
+      yield* def.execute(
+        {
+          description: "review code again",
+          prompt: "review again",
+          subagent_type: "general",
+          task_id: child.id,
+          resume: true,
+          metadata: { round: 2 },
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      const updated = yield* sessions.get(child.id)
+      expect(updated.metadata).toEqual({ domain: "code-review", round: 2 })
     }),
   )
 
@@ -506,6 +649,7 @@ describe("tool.task", () => {
           Effect.sync(() => {
             cancelled.resolve(sessionID)
           }),
+        cancelRun: () => Effect.void,
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
         prompt: (input) =>
           Effect.promise(() => {
@@ -770,6 +914,291 @@ describe("tool.task", () => {
     },
   )
 
+  it.instance(
+    "execute uses explicit model override before subagent and parent models",
+    () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const calls: unknown[] = []
+        let seen: SessionPrompt.PromptInput | undefined
+        const promptOps = stubOps({ onPrompt: (input) => (seen = input) })
+
+        const result = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+            model: "anthropic/claude-sonnet-4",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: (input) =>
+              Effect.sync(() => {
+                calls.push(input)
+              }),
+          },
+        )
+
+        expect(result.metadata.model.providerID as string).toBe("anthropic")
+        expect(result.metadata.model.modelID as string).toBe("claude-sonnet-4")
+        expect((seen?.model?.providerID ?? "") as string).toBe("anthropic")
+        expect((seen?.model?.modelID ?? "") as string).toBe("claude-sonnet-4")
+        expect(calls[0]).toEqual({
+          permission: "model_override",
+          patterns: ["anthropic/claude-sonnet-4"],
+          always: ["anthropic/claude-sonnet-4"],
+          metadata: {
+            description: "inspect bug",
+            subagent_type: "general",
+            model: "anthropic/claude-sonnet-4",
+          },
+        })
+        expect(calls[1]).toEqual({
+          permission: "task",
+          patterns: ["general"],
+          always: ["*"],
+          metadata: {
+            description: "inspect bug",
+            subagent_type: "general",
+          },
+        })
+      }),
+    {
+      config: {
+        agent: {
+          general: {
+            model: "openai/gpt-4o-mini",
+          },
+        },
+      },
+    },
+  )
+
+  it.instance("does not bypass model_override permission check when task check is bypassed", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const calls: unknown[] = []
+      const promptOps = stubOps()
+
+      const result = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+          model: "anthropic/claude-sonnet-4",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps, bypassAgentCheck: true },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: (input) =>
+            Effect.sync(() => {
+              calls.push(input)
+            }),
+        },
+      )
+
+      expect(calls).toHaveLength(1)
+      expect(calls[0]).toEqual({
+        permission: "model_override",
+        patterns: ["anthropic/claude-sonnet-4"],
+        always: ["anthropic/claude-sonnet-4"],
+        metadata: {
+          description: "inspect bug",
+          subagent_type: "general",
+          model: "anthropic/claude-sonnet-4",
+        },
+      })
+      expect(result.metadata.model.providerID as string).toBe("anthropic")
+      expect(result.metadata.model.modelID as string).toBe("claude-sonnet-4")
+    }),
+  )
+
+  it.instance("stops before task permission when model override permission fails", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const calls: unknown[] = []
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+            model: "anthropic/claude-sonnet-4",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps() },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: (input) =>
+              Effect.sync(() => {
+                calls.push(input)
+              }).pipe(
+                Effect.andThen(
+                  input.permission === "model_override"
+                    ? Effect.die(new Error("model override denied"))
+                    : Effect.void,
+                ),
+              ),
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(calls).toEqual([
+        {
+          permission: "model_override",
+          patterns: ["anthropic/claude-sonnet-4"],
+          always: ["anthropic/claude-sonnet-4"],
+          metadata: {
+            description: "inspect bug",
+            subagent_type: "general",
+            model: "anthropic/claude-sonnet-4",
+          },
+        },
+      ])
+    }),
+  )
+
+  it.instance(
+    "execute uses subagent model when no explicit override is provided",
+    () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        let seen: SessionPrompt.PromptInput | undefined
+        const promptOps = stubOps({ onPrompt: (input) => (seen = input) })
+
+        const result = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        expect(result.metadata.model.providerID as string).toBe("openai")
+        expect(result.metadata.model.modelID as string).toBe("gpt-4o-mini")
+        expect((seen?.model?.providerID ?? "") as string).toBe("openai")
+        expect((seen?.model?.modelID ?? "") as string).toBe("gpt-4o-mini")
+      }),
+    {
+      config: {
+        agent: {
+          general: {
+            model: "openai/gpt-4o-mini",
+          },
+        },
+      },
+    },
+  )
+
+  it.instance("execute uses parent assistant model when no explicit or subagent model is provided", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      let seen: SessionPrompt.PromptInput | undefined
+      const promptOps = stubOps({ onPrompt: (input) => (seen = input) })
+
+      const result = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(result.metadata.model.providerID).toBe(ref.providerID)
+      expect(result.metadata.model.modelID).toBe(ref.modelID)
+      expect(seen?.model?.providerID).toBe(ref.providerID)
+      expect(seen?.model?.modelID).toBe(ref.modelID)
+    }),
+  )
+
+  it.instance("rejects invalid model override strings before asking permissions", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      yield* Effect.forEach(["gpt-4o", "openai/"], (model) =>
+        Effect.gen(function* () {
+          const calls: unknown[] = []
+          const exit = yield* def
+            .execute(
+              {
+                description: "inspect bug",
+                prompt: "look into the cache key path",
+                subagent_type: "general",
+                model,
+              },
+              {
+                sessionID: chat.id,
+                messageID: assistant.id,
+                agent: "build",
+                abort: new AbortController().signal,
+                extra: { promptOps: stubOps() },
+                messages: [],
+                metadata: () => Effect.void,
+                ask: (input) =>
+                  Effect.sync(() => {
+                    calls.push(input)
+                  }),
+              },
+            )
+            .pipe(Effect.exit)
+
+          expect(Exit.isFailure(exit)).toBe(true)
+          if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain(`Invalid model format: "${model}"`)
+          expect(calls).toHaveLength(0)
+        }),
+      )
+    }),
+  )
+
   it.instance("rejects background execution when the experiment is disabled", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seed()
@@ -813,6 +1242,7 @@ describe("tool.task", () => {
       let runs = 0
       const promptOps: TaskPromptOps = {
         cancel: () => Effect.void,
+        cancelRun: () => Effect.void,
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
         prompt: (input) => {
           if (input.sessionID === chat.id) {
@@ -902,6 +1332,101 @@ describe("tool.task", () => {
       expect(result.metadata.background).toBe(true)
       expect(result.output).toContain(`state="running"`)
       expect(job?.status).toBe("running")
+    }),
+  )
+
+  background.instance("notifies the parent with a fallback when a background task error is blank", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
+      let error = ""
+      const fakeBackground: BackgroundJob.Interface = {
+        list: () => Effect.succeed([]),
+        get: () => Effect.succeed(undefined),
+        start: (input) =>
+          Effect.succeed({
+            id: input.id ?? "task",
+            type: input.type,
+            title: input.title,
+            status: "running",
+            started_at: 0,
+            metadata: input.metadata,
+          }),
+        extend: () => Effect.succeed(false),
+        wait: () =>
+          Effect.succeed({
+            timedOut: false,
+            info: { id: "task", type: "task", status: "error", started_at: 0, error },
+          }),
+        waitForPromotion: () => Effect.never,
+        message: () => Effect.succeed(undefined),
+        waitForMessage: () => Effect.never,
+        promote: () => Effect.succeed(undefined),
+        cancel: () => Effect.succeed(undefined),
+      }
+      const task = yield* TaskTool.pipe(Effect.provideService(BackgroundJob.Service, fakeBackground))
+      const def = yield* task.init()
+      const promptOps: TaskPromptOps = {
+        cancel: () => Effect.void,
+        cancelRun: () => Effect.void,
+        resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+        prompt: (input) => {
+          if (input.sessionID === chat.id) return Deferred.succeed(injected, input).pipe(Effect.as(reply(input, "injected")))
+          return Effect.succeed(reply(input, "done"))
+        },
+      }
+      const execute = () =>
+        def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+            background: true,
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+      yield* execute()
+      const blank = yield* Deferred.await(injected)
+      expect(blank.parts[0]?.type).toBe("text")
+      if (blank.parts[0]?.type === "text") expect(blank.parts[0].text).toContain("Task failed")
+
+      error = "real task error"
+      const injectedReal = yield* Deferred.make<SessionPrompt.PromptInput>()
+      const realPromptOps: TaskPromptOps = {
+        ...promptOps,
+        prompt: (input) => Deferred.succeed(injectedReal, input).pipe(Effect.as(reply(input, "injected"))),
+      }
+      yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+          background: true,
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps: realPromptOps },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+      const real = yield* Deferred.await(injectedReal)
+      expect(real.parts[0]?.type).toBe("text")
+      if (real.parts[0]?.type === "text") expect(real.parts[0].text).toContain("real task error")
     }),
   )
 
@@ -1292,6 +1817,202 @@ describe("tool.task", () => {
       }),
   )
 
+  it.instance(
+    "resume prefers the child session's last-used model over the agent default",
+    () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const sessions = yield* Session.Service
+        const child = yield* sessions.create({
+          parentID: chat.id,
+          title: "resumed child",
+          agent: "general",
+          model: {
+            providerID: ProviderV2.ID.make("anthropic"),
+            id: ModelV2.ID.make("claude-sonnet-4"),
+          },
+        })
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        let seen: SessionPrompt.PromptInput | undefined
+        const promptOps = stubOps({ onPrompt: (input) => (seen = input) })
+
+        const result = yield* def.execute(
+          { description: "continue work", prompt: "keep going", subagent_type: "general", task_id: child.id, resume: true },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        expect(result.metadata.model.providerID as string).toBe("anthropic")
+        expect(result.metadata.model.modelID as string).toBe("claude-sonnet-4")
+        expect((seen?.model?.providerID ?? "") as string).toBe("anthropic")
+        expect((seen?.model?.modelID ?? "") as string).toBe("claude-sonnet-4")
+      }),
+    { config: { agent: { general: { model: "openai/gpt-4o-mini" } } } },
+  )
+
+  it.instance(
+    "resume with explicit model param overrides the session's last-used model",
+    () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const sessions = yield* Session.Service
+        const child = yield* sessions.create({
+          parentID: chat.id,
+          title: "resumed child",
+          agent: "general",
+          model: {
+            providerID: ProviderV2.ID.make("anthropic"),
+            id: ModelV2.ID.make("claude-sonnet-4"),
+          },
+        })
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        let seen: SessionPrompt.PromptInput | undefined
+        const promptOps = stubOps({ onPrompt: (input) => (seen = input) })
+
+        const result = yield* def.execute(
+          {
+            description: "continue work",
+            prompt: "keep going",
+            subagent_type: "general",
+            task_id: child.id,
+            resume: true,
+            model: "openai/gpt-4o",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        expect(result.metadata.model.providerID as string).toBe("openai")
+        expect(result.metadata.model.modelID as string).toBe("gpt-4o")
+        expect((seen?.model?.providerID ?? "") as string).toBe("openai")
+        expect((seen?.model?.modelID ?? "") as string).toBe("gpt-4o")
+      }),
+    { config: { agent: { general: { model: "openai/gpt-4o-mini" } } } },
+  )
+
+  it.instance(
+    "resume preserves the child session's last-used variant",
+    () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const sessions = yield* Session.Service
+        const child = yield* sessions.create({
+          parentID: chat.id,
+          title: "resumed child",
+          agent: "general",
+          model: {
+            providerID: ProviderV2.ID.make("anthropic"),
+            id: ModelV2.ID.make("claude-sonnet-4"),
+            variant: "thinking",
+          },
+        })
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        let seen: SessionPrompt.PromptInput | undefined
+        const promptOps = stubOps({ onPrompt: (input) => (seen = input) })
+
+        yield* def.execute(
+          { description: "continue work", prompt: "keep going", subagent_type: "general", task_id: child.id, resume: true },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        expect(seen?.variant).toBe("thinking")
+      }),
+    { config: { agent: { general: { model: "openai/gpt-4o-mini" } } } },
+  )
+
+  it.instance(
+    "passes an explicit variant through to the child prompt",
+    () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        let seen: SessionPrompt.PromptInput | undefined
+        const promptOps = stubOps({ onPrompt: (input) => (seen = input) })
+
+        yield* def.execute(
+          { description: "think hard", prompt: "analyze", subagent_type: "general", variant: "thinking" },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        expect(seen?.variant).toBe("thinking")
+      }),
+  )
+
+  it.instance(
+    "slug task_id creates a named child and resumes it on the second dispatch",
+    () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const sessions = yield* Session.Service
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const promptOps = stubOps()
+
+        const dispatch = (desc: string, extras?: Record<string, unknown>) =>
+          def.execute(
+            { description: desc, prompt: "do work", subagent_type: "general", task_id: "explore-auth", ...extras },
+            {
+              sessionID: chat.id,
+              messageID: assistant.id,
+              agent: "build",
+              abort: new AbortController().signal,
+              extra: { promptOps },
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.void,
+            },
+          )
+
+        const first = yield* dispatch("create slug child", { metadata: { domain: "exploration" } })
+        const second = yield* dispatch("resume slug child", { resume: true })
+
+        expect(first.metadata.sessionId).toBe(second.metadata.sessionId)
+
+        const child = yield* sessions.get(first.metadata.sessionId)
+        expect(child.slug).toBe("explore-auth")
+        expect(child.parentID).toBe(chat.id)
+        expect(child.metadata).toEqual({ domain: "exploration" })
+      }),
+  )
+
   it.instance("completed task publishes enriched task.completed event", () =>
     Effect.gen(function* () {
       const events = yield* EventV2Bridge.Service
@@ -1302,6 +2023,7 @@ describe("tool.task", () => {
 
       const promptOps: TaskPromptOps = {
         cancel: () => Effect.void,
+        cancelRun: () => Effect.void,
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
         prompt: (input) =>
           Effect.sync(() => {
@@ -1412,6 +2134,7 @@ const itBroken = testEffect(Layer.provideMerge(brokenSessionLayer, withRipgrep()
       const def = yield* tool.init()
       const promptOps: TaskPromptOps = {
         cancel: () => Effect.void,
+        cancelRun: () => Effect.void,
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
         prompt: (input) =>
           Effect.sync(() => {
@@ -1483,6 +2206,7 @@ const itBroken = testEffect(Layer.provideMerge(brokenSessionLayer, withRipgrep()
       const childText = "CHILD_OUTPUT_BODY"
       const promptOps: TaskPromptOps = {
         cancel: () => Effect.void,
+        cancelRun: () => Effect.void,
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
         prompt: (input) =>
           Effect.sync(() => {
@@ -1551,6 +2275,7 @@ const itBroken = testEffect(Layer.provideMerge(brokenSessionLayer, withRipgrep()
 
       const promptOps: TaskPromptOps = {
         cancel: () => Effect.void,
+        cancelRun: () => Effect.void,
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
         prompt: (input) =>
           Effect.sync(() => {
@@ -1625,7 +2350,127 @@ const itBroken = testEffect(Layer.provideMerge(brokenSessionLayer, withRipgrep()
     }),
   )
 
+  it.instance("falls back to fallback_model when the primary attempt times out", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const prompts: SessionPrompt.PromptInput[] = []
+      const cancelRuns: number[] = []
+      const ops: TaskPromptOps = {
+        cancel: () => Effect.void,
+        cancelRun: () => Effect.sync(() => { cancelRuns.push(1) }),
+        resolvePromptParts: (template) => Effect.succeed([{ type: "text", text: template }]),
+        prompt: (input) => {
+          prompts.push(input)
+          if (prompts.length === 1) return Effect.never
+          return Effect.succeed(reply(input, "fallback says hi"))
+        },
+      }
 
+      const result = yield* def.execute(
+        {
+          description: "d",
+          prompt: "p",
+          subagent_type: "general",
+          timeout: 2000,
+          fallback_model: "openai/gpt-4o",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps: ops },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(prompts.length).toBe(2)
+      expect(cancelRuns.length).toBe(1)
+      expect((prompts[1]?.model?.providerID ?? "") as string).toBe("openai")
+      expect((prompts[1]?.model?.modelID ?? "") as string).toBe("gpt-4o")
+      expect(result.output).toContain("fallback says hi")
+      expect((result.metadata as { fallback_used?: boolean }).fallback_used).toBe(true)
+    }),
+  )
+
+  it.instance("cancels the child runner when the fallback attempt fails", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const prompts: SessionPrompt.PromptInput[] = []
+      const cancelRuns: number[] = []
+      const ops: TaskPromptOps = {
+        cancel: () => Effect.void,
+        cancelRun: () => Effect.sync(() => { cancelRuns.push(1) }),
+        resolvePromptParts: (template) => Effect.succeed([{ type: "text", text: template }]),
+        prompt: (input) => {
+          prompts.push(input)
+          return Effect.never
+        },
+      }
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "d",
+            prompt: "p",
+            subagent_type: "general",
+            timeout: 100,
+            fallback_model: "openai/gpt-4o",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: ops },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(prompts).toHaveLength(2)
+      expect(cancelRuns).toHaveLength(2)
+    }),
+  )
+
+  it.instance("does not cancel the child runner when the task succeeds", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const cancelRuns: number[] = []
+      const ops: TaskPromptOps = {
+        ...stubOps({ onPrompt: () => undefined }),
+        cancelRun: () => Effect.sync(() => { cancelRuns.push(1) }),
+      }
+
+      const result = yield* def.execute(
+        { description: "d", prompt: "p", subagent_type: "general" },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps: ops },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(result.output).toContain("done")
+      expect(cancelRuns).toHaveLength(0)
+    }),
+  )
 
   it.instance("sparse context stores contextMode on the child session", () =>
     Effect.gen(function* () {
@@ -1686,10 +2531,98 @@ const itBroken = testEffect(Layer.provideMerge(brokenSessionLayer, withRipgrep()
         },
       )
 
-      // Re-fetch — contextMode must survive the roundtrip
       const child = yield* sessions.get(result.metadata.sessionId)
       expect(child.contextMode).toBe("sparse")
       expect(child.id).toBe(result.metadata.sessionId)
+    }),
+  )
+
+  it.instance("timeout without fallback fails the task", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const promptSessionIDs: SessionID[] = []
+      const cancelRunSessionIDs: SessionID[] = []
+      const cancelRunCalled = yield* Deferred.make<void>()
+      const ops: TaskPromptOps = {
+        ...stubOps({
+          onPrompt: (input) => {
+            promptSessionIDs.push(input.sessionID)
+          },
+        }),
+        cancelRun: (sessionID) =>
+          Effect.gen(function* () {
+            cancelRunSessionIDs.push(sessionID)
+            yield* Deferred.succeed(cancelRunCalled, undefined)
+          }),
+        prompt: (input) =>
+          Effect.gen(function* () {
+            promptSessionIDs.push(input.sessionID)
+            return yield* (Effect.never as Effect.Effect<SessionV1.WithParts>)
+          }),
+      }
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "d",
+            prompt: "p",
+            subagent_type: "general",
+            timeout: 500,
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: ops },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      yield* Deferred.await(cancelRunCalled).pipe(Effect.timeout("2 seconds"))
+      expect(cancelRunSessionIDs).toEqual([promptSessionIDs[0]])
+    }),
+  )
+
+  it.instance("gates fallback_model behind model_override permission up front", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const calls: unknown[] = []
+      const ops = stubOps()
+
+      yield* def.execute(
+        {
+          description: "d",
+          prompt: "p",
+          subagent_type: "general",
+          fallback_model: "openai/gpt-4o",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps: ops },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: (input) =>
+            Effect.sync(() => {
+              calls.push(input)
+            }),
+        },
+      )
+
+      const first = calls[0] as { permission: string; patterns: string[] }
+      expect(first.permission).toBe("model_override")
+      expect(first.patterns).toEqual(["openai/gpt-4o"])
     }),
   )
 
@@ -1753,6 +2686,95 @@ const itBroken = testEffect(Layer.provideMerge(brokenSessionLayer, withRipgrep()
 
       const child = yield* sessions.get(result.metadata.sessionId)
       expect(child.contextMode).toBeUndefined()
+    }),
+  )
+
+  it.instance("does not fall back when the primary attempt is interrupted", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const prompts: SessionPrompt.PromptInput[] = []
+      const ops: TaskPromptOps = {
+        cancel: () => Effect.void,
+        cancelRun: () => Effect.void,
+        resolvePromptParts: (template) => Effect.succeed([{ type: "text", text: template }]),
+        prompt: (input) => {
+          prompts.push(input)
+          return Effect.interrupt
+        },
+      }
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "d",
+            prompt: "p",
+            subagent_type: "general",
+            timeout: 2000,
+            fallback_model: "openai/gpt-4o",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: ops },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isSuccess(exit)).toBe(true)
+      if (Exit.isSuccess(exit)) {
+        expect(exit.value.output).toContain('state="aborted"')
+        expect(exit.value.output).toContain("<task_aborted>")
+      }
+      expect(prompts.length).toBe(1)
+    }),
+  )
+
+  it.instance("does not fall back on a die (defect)", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const prompts: SessionPrompt.PromptInput[] = []
+      const ops: TaskPromptOps = {
+        cancel: () => Effect.void,
+        cancelRun: () => Effect.void,
+        resolvePromptParts: (template) => Effect.succeed([{ type: "text", text: template }]),
+        prompt: (input) => {
+          prompts.push(input)
+          return Effect.die(new Error("boom"))
+        },
+      }
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "d",
+            prompt: "p",
+            subagent_type: "general",
+            fallback_model: "openai/gpt-4o",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: ops },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(prompts.length).toBe(1)
     }),
   )
 })
