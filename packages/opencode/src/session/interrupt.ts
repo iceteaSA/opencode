@@ -2,6 +2,7 @@ import { Context, Effect, Layer, Option, Schema } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { InterruptEvent } from "@opencode-ai/schema"
 import { InstanceState } from "@/effect/instance-state"
+import { Identifier } from "@/id/id"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { MessageV2 } from "@/session/message-v2"
@@ -170,11 +171,13 @@ export const abortChild = (
     if (Option.isSome(childMessages)) {
       const { user: lastUser } = MessageV2.latest(childMessages.value)
       if (lastUser) {
+        const created = Date.now()
+        const id = MessageID.ascending(Identifier.create("msg", "ascending", created))
         const msg: SessionV1.User = {
-          id: MessageID.ascending(),
+          id,
           sessionID: input.childID,
           role: "user",
-          time: { created: Date.now() },
+          time: { created },
           agent: lastUser.agent,
           model: lastUser.model,
         }

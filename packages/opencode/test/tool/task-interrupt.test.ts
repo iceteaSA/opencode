@@ -24,6 +24,7 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { ToolRegistry } from "@/tool/registry"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Messaging } from "@/messaging"
+import { Identifier } from "../../src/id/id"
 
 const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
   LayerNode.compile(
@@ -551,6 +552,37 @@ describe("tool.task-interrupt", () => {
             ),
         )
         expect(visibleAbort).toBe(true)
+      }),
+  )
+
+  it.instance(
+    "abortChild: persists the marker timestamp from its one-clock message ID",
+    () =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const abort = yield* (yield* TaskAbortTool).init()
+        const parent = yield* sessions.create({ title: "caller" })
+        const child = yield* startRunningChild(parent.id)
+
+        const original = Date.now
+        let reads = 0
+        Date.now = () => 10_000 + reads++
+        try {
+          yield* abort.execute({ task_id: child.id, reason: "one clock" }, ctxFor(parent.id))
+        } finally {
+          Date.now = original
+        }
+
+        const childMessages = yield* sessions.messages({ sessionID: child.id })
+        const markerMessage = childMessages.find(
+          (msg) =>
+            msg.info.role === "user" &&
+            msg.parts.some(
+              (part) => part.type === "text" && part.synthetic === false && part.text === "⊘ Aborted by parent: one clock",
+            ),
+        )
+        expect(markerMessage).toBeDefined()
+        expect(Identifier.timestamp(markerMessage!.info.id)).toBe(markerMessage!.info.time.created)
       }),
   )
 
