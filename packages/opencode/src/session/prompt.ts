@@ -4,6 +4,7 @@ import path from "path"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import os from "os"
 import { SessionID, MessageID, PartID } from "./schema"
+import { Identifier } from "@/id/id"
 import { MessageV2 } from "./message-v2"
 import { Interrupt } from "./interrupt"
 import { Marker } from "./marker"
@@ -285,8 +286,9 @@ export const layer = Layer.effect(
       const promptOps = yield* ops()
       const { task: taskTool } = yield* registry.named()
       const taskModel = task.model ? yield* getModel(task.model.providerID, task.model.modelID, sessionID) : model
+      const created = Date.now()
       const assistantMessage: SessionV1.Assistant = yield* sessions.updateMessage({
-        id: MessageID.ascending(),
+        id: MessageID.ascending(Identifier.create("msg", "ascending", created)),
         role: "assistant",
         parentID: lastUser.id,
         sessionID,
@@ -298,7 +300,7 @@ export const layer = Layer.effect(
         tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
         modelID: taskModel.id,
         providerID: taskModel.providerID,
-        time: { created: Date.now() },
+        time: { created },
       })
       let part: SessionV1.ToolPart = yield* sessions.updatePart({
         id: PartID.ascending(),
@@ -449,11 +451,12 @@ export const layer = Layer.effect(
 
       if (!task.command) return
 
+      const summaryCreated = Date.now()
       const summaryUserMsg: SessionV1.User = {
-        id: MessageID.ascending(),
+        id: MessageID.ascending(Identifier.create("msg", "ascending", summaryCreated)),
         sessionID,
         role: "user",
-        time: { created: Date.now() },
+        time: { created: summaryCreated },
         agent: lastUser.agent,
         model: lastUser.model,
       }
@@ -488,10 +491,11 @@ export const layer = Layer.effect(
             }
             const model = input.model ?? agent.model ?? (yield* currentModel(input.sessionID))
             const variant = "variant" in model && typeof model.variant === "string" ? model.variant : undefined
+            const userCreated = Date.now()
             const userMsg: SessionV1.User = {
-              id: input.messageID ?? MessageID.ascending(),
+              id: input.messageID ?? MessageID.ascending(Identifier.create("msg", "ascending", userCreated)),
               sessionID: input.sessionID,
-              time: { created: Date.now() },
+              time: { created: userCreated },
               role: "user",
               agent: input.agent,
               model: { providerID: model.providerID, modelID: model.modelID, variant },
@@ -507,15 +511,16 @@ export const layer = Layer.effect(
             }
             yield* sessions.updatePart(userPart)
 
+            const assistantCreated = Date.now()
             const msg: SessionV1.Assistant = {
-              id: MessageID.ascending(),
+              id: MessageID.ascending(Identifier.create("msg", "ascending", assistantCreated)),
               sessionID: input.sessionID,
               parentID: userMsg.id,
               mode: input.agent,
               agent: input.agent,
               cost: 0,
               path: { cwd: ctx.directory, root: ctx.worktree },
-              time: { created: Date.now() },
+              time: { created: assistantCreated },
               role: "assistant",
               tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
               modelID: model.modelID,
@@ -697,11 +702,12 @@ export const layer = Layer.effect(
       const modelVariant = model === sessionModel ? sessionModel.variant : model === prev?.info.model ? prev.info.model.variant : undefined
       const variant = input.variant ?? modelVariant ?? (ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined)
 
+      const created = Date.now()
       const info: SessionV1.User = {
-        id: input.messageID ?? MessageID.ascending(),
+        id: input.messageID ?? MessageID.ascending(Identifier.create("msg", "ascending", created)),
         role: "user",
         sessionID: input.sessionID,
-        time: { created: Date.now() },
+        time: { created },
         tools: input.tools,
         agent: ag.name,
         model: {
@@ -1149,11 +1155,12 @@ export const layer = Layer.effect(
               pendingInterrupt.value.intent === "cancel"
                 ? Interrupt.renderCancel(pendingInterrupt.value.reason)
                 : Interrupt.renderSteer(pendingInterrupt.value.reason)
+            const created = Date.now()
             const interruptMsg: SessionV1.User = {
-              id: MessageID.ascending(),
+              id: MessageID.ascending(Identifier.create("msg", "ascending", created)),
               sessionID,
               role: "user",
-              time: { created: Date.now() },
+              time: { created },
               agent: lastUser.agent,
               model: lastUser.model,
             }
@@ -1252,11 +1259,12 @@ export const layer = Layer.effect(
 
             const inboxItems = yield* messaging.drain(sessionID)
             if (inboxItems.length > 0) {
+              const created = Date.now()
               const inboxMsg: SessionV1.User = {
-                id: MessageID.ascending(),
+                id: MessageID.ascending(Identifier.create("msg", "ascending", created)),
                 sessionID,
                 role: "user",
-                time: { created: Date.now() },
+                time: { created },
                 agent: lastUser.agent,
                 model: lastUser.model,
               }
@@ -1405,8 +1413,9 @@ export const layer = Layer.effect(
             Effect.provideService(Session.Service, sessions),
           )
 
+          const created = Date.now()
           const msg: SessionV1.Assistant = {
-            id: MessageID.ascending(),
+            id: MessageID.ascending(Identifier.create("msg", "ascending", created)),
             parentID: lastUser.id,
             role: "assistant",
             mode: agent.name,
@@ -1417,7 +1426,7 @@ export const layer = Layer.effect(
             tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
             modelID: model.id,
             providerID: model.providerID,
-            time: { created: Date.now() },
+            time: { created },
             sessionID,
           }
           yield* sessions.updateMessage(msg)
