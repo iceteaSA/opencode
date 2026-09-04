@@ -20,6 +20,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { ToolRegistry } from "@/tool/registry"
 import { Truncate } from "@/tool/truncate"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
+import { Identifier } from "../../src/id/id"
 import type { PromptInput } from "../../src/session/prompt"
 
 import { MessageTool, renderMarker, writeMarker, escapeBody } from "../../src/tool/message"
@@ -190,6 +191,48 @@ describe("tool.message", () => {
             "✉ Message from subagent (awaiting your reply): go left or right?",
           )
           expect(markers[0]?.meta).toEqual({ kind: "message", peer: "subagent", expectReply: true })
+        }),
+    )
+
+    it.instance(
+      "writeMarker: persists the marker timestamp from its one-clock message ID",
+      () =>
+        Effect.gen(function* () {
+          const sessions = yield* Session.Service
+          const chat = yield* seedSession()
+
+          yield* Effect.acquireUseRelease(
+            Effect.sync(() => {
+              const original = Date.now
+              let reads = 0
+              Date.now = () => 20_000 + reads++
+              return original
+            }),
+            () =>
+              writeMarker(sessions, {
+                sessionID: chat.id,
+                peer: "subagent",
+                body: "one clock",
+              }),
+            (original) =>
+              Effect.sync(() => {
+                Date.now = original
+              }),
+          )
+
+          const messages = yield* sessions.messages({ sessionID: chat.id })
+          const markerMessage = messages.find(
+            (msg) =>
+              msg.info.role === "user" &&
+              msg.parts.some(
+                (part) =>
+                  part.type === "text" &&
+                  part.synthetic === false &&
+                  part.text === "✉ Message from subagent: one clock",
+              ),
+          )
+          expect(markerMessage).toBeDefined()
+          expect(Identifier.timestamp(markerMessage!.info.id)).toBe(markerMessage!.info.time.created)
         }),
     )
 
