@@ -68,6 +68,7 @@ function makeSessionLayer(chain: Chain, hasUserMessage: boolean) {
     Session.Service.of({
       list: () => Effect.succeed([]),
       listGlobal: () => Effect.succeed([]),
+      root: (id) => Effect.succeed(id),
       create: () => Effect.succeed({ id: CHILD, parentID: PARENT } as any),
       fork: () => Effect.succeed({ id: CHILD } as any),
       touch: () => Effect.void,

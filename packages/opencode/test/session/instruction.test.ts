@@ -431,8 +431,8 @@ describe("Instruction.systemScoped", () => {
 
       yield* Effect.gen(function* () {
         const svc = yield* Instruction.Service
-        const projectOnly = yield* svc.systemScoped("project")
-        const all = yield* svc.systemScoped("all")
+        const projectOnly = yield* svc.systemScoped("project", mainBuild)
+        const all = yield* svc.systemScoped("all", mainBuild)
 
         // "project" scope: only project AGENTS.md, not global
         expect(projectOnly).toHaveLength(1)
@@ -452,8 +452,8 @@ describe("Instruction.systemScoped", () => {
 
       yield* Effect.gen(function* () {
         const svc = yield* Instruction.Service
-        const full = yield* svc.system()
-        const scoped = yield* svc.systemScoped("all")
+        const full = yield* svc.system(mainBuild)
+        const scoped = yield* svc.systemScoped("all", mainBuild)
         expect(scoped).toEqual(full)
       }).pipe(provideInstance(projectTmp), provideInstruction({ home: globalTmp, config: globalTmp }))
     }),
@@ -475,8 +475,8 @@ describe("Instruction.systemScoped config-instructions", () => {
 
       yield* Effect.gen(function* () {
         const svc = yield* Instruction.Service
-        const projectOnly = yield* svc.systemScoped("project")
-        const all = yield* svc.systemScoped("all")
+        const projectOnly = yield* svc.systemScoped("project", mainBuild)
+        const all = yield* svc.systemScoped("all", mainBuild)
 
         // "project" scope: only project AGENTS.md, not config extra.md
         expect(projectOnly).toHaveLength(1)
