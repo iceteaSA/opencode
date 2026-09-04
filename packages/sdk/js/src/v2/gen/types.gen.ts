@@ -84,6 +84,8 @@ export type Event =
   | EventMessagingSent
   | EventMessagingReplied
   | EventMessagingRejected
+  | EventMessagingPeerSent
+  | EventS2sDelivered
   | EventCommandExecuted
   | EventProjectUpdated
   | EventSessionStatus
@@ -100,6 +102,7 @@ export type Event =
   | EventWorktreeFailed
   | EventServerConnected
   | EventGlobalDisposed
+  | EventTaskCompleted
   | EventServerInstanceDisposed
 
 export type QuestionReplied = {
@@ -212,6 +215,9 @@ export type Session = {
   metadata?: {
     [key: string]: unknown
   }
+  result?: {
+    [key: string]: unknown
+  }
   time: {
     created: number
     updated: number
@@ -225,6 +231,7 @@ export type Session = {
     snapshot?: string
     diff?: string
   }
+  contextMode?: "full" | "sparse"
 }
 
 export type OutputFormatText = {
@@ -1539,6 +1546,26 @@ export type GlobalEvent = {
       }
     | {
         id: string
+        type: "messaging.peer_sent"
+        properties: {
+          from: string
+          target: string
+          fromSlug: string
+          body: string
+        }
+      }
+    | {
+        id: string
+        type: "s2s.delivered"
+        properties: {
+          target: string
+          from: string
+          fromName?: string
+          body: string
+        }
+      }
+    | {
+        id: string
         type: "command.executed"
         properties: {
           name: string
@@ -1671,6 +1698,31 @@ export type GlobalEvent = {
           [key: string]: unknown
         }
       }
+    | {
+        id: string
+        type: "task.completed"
+        properties: {
+          sessionID: string
+          parentSessionID: string
+          status: "ok" | "error" | "aborted"
+          slug?: string
+          agent?: string
+          model?: string
+          variant?: string
+          elapsedMs?: number
+          tokens?: {
+            input?: number
+            output?: number
+            reasoning?: number
+            cacheRead?: number
+            cacheWrite?: number
+          }
+          cost?: number
+          result?: {
+            [key: string]: unknown
+          }
+        }
+      }
     | EventServerInstanceDisposed
     | SyncEventSessionCreated
     | SyncEventSessionUpdated
@@ -1779,6 +1831,8 @@ export type AgentConfig = {
   color?: string | "primary" | "secondary" | "accent" | "success" | "warning" | "error" | "info"
   steps?: number
   maxSteps?: number
+  completion?: "full" | "terse"
+  context?: "full" | "sparse"
   permission?: PermissionConfig
   [key: string]:
     | unknown
@@ -1803,6 +1857,10 @@ export type AgentConfig = {
     | "error"
     | "info"
     | number
+    | "full"
+    | "terse"
+    | "full"
+    | "sparse"
     | PermissionConfig
     | undefined
 }
@@ -2010,6 +2068,7 @@ export type Config = {
   small_model?: string
   default_agent?: string
   subagent_depth?: number
+  subagent_max_children?: number
   username?: string
   mode?: {
     build?: AgentConfig
@@ -2094,6 +2153,16 @@ export type Config = {
     tail_turns?: number
     preserve_recent_tokens?: number
     reserved?: number
+  }
+  task?: {
+    completion?: "full" | "terse"
+    context?: "full" | "sparse"
+  }
+  retention?: {
+    /**
+     * Delete durable event history and make event replay unavailable for sessions idle longer than this many days
+     */
+    event_idle_days?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   }
   experimental?: {
     disable_paste_summary?: boolean
@@ -2308,6 +2377,10 @@ export type GlobalSession = {
   metadata?: {
     [key: string]: unknown
   }
+  result?: {
+    [key: string]: unknown
+  }
+  contextMode?: "full" | "sparse"
   time: {
     created: number
     updated: number
@@ -2445,6 +2518,8 @@ export type Agent = {
     [key: string]: unknown
   }
   steps?: number
+  completion?: "full" | "terse"
+  context?: "full" | "sparse"
 }
 
 export type LspStatus = {
@@ -3010,6 +3085,8 @@ export type V2Event =
   | MessagingSent
   | MessagingReplied
   | MessagingRejected
+  | MessagingPeerSent
+  | S2sDelivered
   | CommandExecuted
   | ProjectUpdated
   | SessionStatus2
@@ -3026,6 +3103,7 @@ export type V2Event =
   | WorktreeFailed
   | ServerConnected
   | GlobalDisposed
+  | TaskCompleted
 
 export type V2EventStream = string
 
@@ -4012,6 +4090,10 @@ export type SessionV2Info = {
   location: LocationRef
   subpath?: string
   revert?: RevertState
+  result?: {
+    [key: string]: unknown
+  }
+  contextMode?: "full" | "sparse"
 }
 
 export type PromptInputFileAttachment = {
@@ -6081,6 +6163,46 @@ export type MessagingRejected = {
   }
 }
 
+export type MessagingPeerSent = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "messaging.peer_sent"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    from: string
+    target: string
+    fromSlug: string
+    body: string
+  }
+}
+
+export type S2sDelivered = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "s2s.delivered"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    target: string
+    from: string
+    fromName?: string
+    body: string
+  }
+}
+
 export type CommandExecuted = {
   id: string
   metadata?: {
@@ -6317,6 +6439,41 @@ export type GlobalDisposed = {
   location?: LocationRef
   data: {
     [key: string]: unknown
+  }
+}
+
+export type TaskCompleted = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "task.completed"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    sessionID: string
+    parentSessionID: string
+    status: "ok" | "error" | "aborted"
+    slug?: string
+    agent?: string
+    model?: string
+    variant?: string
+    elapsedMs?: number
+    tokens?: {
+      input?: number
+      output?: number
+      reasoning?: number
+      cacheRead?: number
+      cacheWrite?: number
+    }
+    cost?: number
+    result?: {
+      [key: string]: unknown
+    }
   }
 }
 
@@ -7184,6 +7341,28 @@ export type EventMessagingRejected = {
   }
 }
 
+export type EventMessagingPeerSent = {
+  id: string
+  type: "messaging.peer_sent"
+  properties: {
+    from: string
+    target: string
+    fromSlug: string
+    body: string
+  }
+}
+
+export type EventS2sDelivered = {
+  id: string
+  type: "s2s.delivered"
+  properties: {
+    target: string
+    from: string
+    fromName?: string
+    body: string
+  }
+}
+
 export type EventCommandExecuted = {
   id: string
   type: "command.executed"
@@ -7331,6 +7510,32 @@ export type EventGlobalDisposed = {
   type: "global.disposed"
   properties: {
     [key: string]: unknown
+  }
+}
+
+export type EventTaskCompleted = {
+  id: string
+  type: "task.completed"
+  properties: {
+    sessionID: string
+    parentSessionID: string
+    status: "ok" | "error" | "aborted"
+    slug?: string
+    agent?: string
+    model?: string
+    variant?: string
+    elapsedMs?: number
+    tokens?: {
+      input?: number
+      output?: number
+      reasoning?: number
+      cacheRead?: number
+      cacheWrite?: number
+    }
+    cost?: number
+    result?: {
+      [key: string]: unknown
+    }
   }
 }
 
@@ -9754,8 +9959,10 @@ export type SessionListResponse = SessionListResponses[keyof SessionListResponse
 
 export type SessionCreateData = {
   body?: {
+    id?: string
     parentID?: string
     title?: string
+    slug?: string
     agent?: string
     model?: {
       id: string
@@ -9767,6 +9974,7 @@ export type SessionCreateData = {
     }
     permission?: PermissionRuleset
     workspaceID?: string
+    contextMode?: "full" | "sparse"
   }
   path?: never
   query?: {
