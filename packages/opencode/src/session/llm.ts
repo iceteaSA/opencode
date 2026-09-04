@@ -29,6 +29,7 @@ import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
+import { SystemPrompt } from "./system"
 
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
 
@@ -45,6 +46,33 @@ export type StreamInput = {
   tools: Record<string, Tool>
   retries?: number
   toolChoice?: "auto" | "required" | "none"
+}
+
+/** Assemble the system prompt before chat hooks observe the request. */
+export function buildSystem(input: {
+  agent: Agent.Info
+  model: Provider.Model
+  parts: string[]
+  user?: { system?: string }
+}): string[] {
+  return [
+    [
+      ...(input.agent.prompt ? [input.agent.prompt] : SystemPrompt.provider(input.model)),
+      ...input.parts,
+      ...(input.user?.system ? [input.user.system] : []),
+    ]
+      .filter((x) => x)
+      .join("\n"),
+  ]
+}
+
+/** Preserve the provider prompt prefix as a separate cacheable system part. */
+export function rejoinSystemForCaching(system: string[], header: string) {
+  if (system.length > 2 && system[0] === header) {
+    const rest = system.slice(1)
+    system.length = 0
+    system.push(header, rest.join("\n"))
+  }
 }
 
 export type StreamRequest = StreamInput & {
