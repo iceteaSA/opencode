@@ -48,6 +48,7 @@ export type Event =
   | EventSessionNextRevertStaged
   | EventSessionNextRevertCleared
   | EventSessionNextRevertCommitted
+  | EventMessageDiffUpdated
   | EventMessagePartDelta
   | EventSessionDiff
   | EventSessionError
@@ -253,6 +254,9 @@ export type UserMessage = {
   summary?: {
     title?: string
     body?: string
+    additions?: number
+    deletions?: number
+    files?: number
     diffs: Array<SnapshotFileDiff>
   }
   agent: string
@@ -1192,6 +1196,14 @@ export type GlobalEvent = {
         type: "session.next.revert.committed"
         properties: {
           timestamp: number
+          sessionID: string
+          messageID: string
+        }
+      }
+    | {
+        id: string
+        type: "message.diff.updated"
+        properties: {
           sessionID: string
           messageID: string
         }
@@ -2961,6 +2973,7 @@ export type V2Event =
   | SessionNextRevertStaged
   | SessionNextRevertCleared
   | SessionNextRevertCommitted
+  | MessageDiffUpdated
   | MessagePartDelta
   | SessionDiff
   | SessionError
@@ -5371,6 +5384,24 @@ export type SessionNextCompactionDelta = {
   }
 }
 
+export type MessageDiffUpdated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "message.diff.updated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    sessionID: string
+    messageID: string
+  }
+}
+
 export type MessagePartDelta = {
   id: string
   metadata?: {
@@ -6830,6 +6861,15 @@ export type EventSessionNextRevertCommitted = {
   type: "session.next.revert.committed"
   properties: {
     timestamp: number
+    sessionID: string
+    messageID: string
+  }
+}
+
+export type EventMessageDiffUpdated = {
+  id: string
+  type: "message.diff.updated"
+  properties: {
     sessionID: string
     messageID: string
   }
