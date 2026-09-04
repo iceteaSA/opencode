@@ -221,6 +221,41 @@ type PromptTestInput = {
   mcpInstructions?: MCP.ServerInstructions[]
   processor?: "blocking"
   runtimeFlags?: Layer.Layer<RuntimeFlags.Service>
+  plugin?: Layer.Layer<Plugin.Service>
+}
+
+function hookOrderPlugin(order: string[]) {
+  return Layer.succeed(
+    Plugin.Service,
+    Plugin.Service.of({
+      init: () => Effect.void,
+      list: () => Effect.succeed([]),
+      trigger: (name, _input, output) =>
+        Effect.sync(() => {
+          if (name === "experimental.chat.system.transform") order.push("system")
+          if (name === "experimental.chat.messages.transform") order.push("messages")
+          return output
+        }),
+    }),
+  )
+}
+
+function messagesTransformPlugin(marker: string) {
+  return Layer.succeed(
+    Plugin.Service,
+    Plugin.Service.of({
+      init: () => Effect.void,
+      list: () => Effect.succeed([]),
+      trigger: (name, _input, output) =>
+        Effect.sync(() => {
+          if (name !== "experimental.chat.messages.transform") return output
+          const messages = (output as { messages: SessionV1.WithParts[] }).messages
+          const part = messages.flatMap((message) => message.parts).find((part) => part.type === "text")
+          if (part) part.text = `${part.text}\n${marker}`
+          return output
+        }),
+    }),
+  )
 }
 
 function makePrompt(input?: PromptTestInput) {
@@ -230,13 +265,14 @@ function makePrompt(input?: PromptTestInput) {
     [MCP.node, makeMcp(input?.mcpInstructions)],
     [RuntimeFlags.node, input?.runtimeFlags ?? runtimeFlags],
   ] as const
-  if (input?.processor === "blocking") {
-    return LayerNode.compile(promptRoot, [...replacements, [SessionProcessor.node, blockingProcessor]])
-  }
-  return LayerNode.compile(promptRoot, replacements)
+  return LayerNode.compile(promptRoot, [
+    ...replacements,
+    ...(input?.processor === "blocking" ? ([[SessionProcessor.node, blockingProcessor]] as const) : []),
+    ...(input?.plugin ? ([[Plugin.node, input.plugin]] as const) : []),
+  ] as LayerNode.Replacements)
 }
 
-function makeHttp(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
+function makeHttp(input?: PromptTestInput) {
   const root = LayerNode.group([promptRoot, testLLMServerNode])
   const replacements = [
     [SessionSummary.node, summary],
@@ -244,10 +280,11 @@ function makeHttp(input?: { mcpInstructions?: MCP.ServerInstructions[]; processo
     [MCP.node, makeMcp(input?.mcpInstructions)],
     [RuntimeFlags.node, runtimeFlags],
   ] as const
-  if (input?.processor === "blocking") {
-    return LayerNode.compile(root, [...replacements, [SessionProcessor.node, blockingProcessor]])
-  }
-  return LayerNode.compile(root, replacements)
+  return LayerNode.compile(root, [
+    ...replacements,
+    ...(input?.processor === "blocking" ? ([[SessionProcessor.node, blockingProcessor]] as const) : []),
+    ...(input?.plugin ? ([[Plugin.node, input.plugin]] as const) : []),
+  ] as LayerNode.Replacements)
 }
 
 function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
@@ -275,6 +312,52 @@ const withMcpInstructions = testEffect(
 )
 const unix = process.platform !== "win32" ? it.instance : it.instance.skip
 const unixNoLLMServer = process.platform !== "win32" ? noLLMServer.instance : noLLMServer.instance.skip
+
+const hookOrder: string[] = []
+const hookOrderIt = testEffect(makeHttp({ plugin: hookOrderPlugin(hookOrder) }))
+const transformIt = testEffect(makeHttp({ plugin: messagesTransformPlugin("plugin-injected-context") }))
+
+transformIt.instance("serializes messages after plugin transform mutations", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Plugin transform" })
+
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "hello" }],
+    })
+    yield* llm.push(reply().text("done"))
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const inputs = yield* llm.inputs
+    expect(JSON.stringify(inputs.at(-1)?.messages)).toContain("plugin-injected-context")
+  }),
+)
+
+hookOrderIt.instance("fires system transform before messages transform", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Hook order" })
+
+    hookOrder.length = 0
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "hello" }],
+    })
+    yield* llm.push(reply().text("done"))
+    yield* prompt.loop({ sessionID: chat.id })
+
+    expect(hookOrder).toEqual(["system", "messages", "system", "messages"])
+  }),
+)
 
 // Config that registers a custom "test" provider with a "test-model" model
 // so provider model lookup succeeds inside the loop.

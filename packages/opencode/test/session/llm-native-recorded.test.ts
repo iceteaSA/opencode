@@ -373,7 +373,7 @@ const driveToolLoop = (scenario: RecordedScenario) =>
       sessionID,
       model: resolved,
       agent,
-      system: [WEATHER_SYSTEM],
+      system: LLM.buildSystem({ agent, model: resolved, parts: [WEATHER_SYSTEM] }),
       tools: { get_weather: weatherTool },
     }
 

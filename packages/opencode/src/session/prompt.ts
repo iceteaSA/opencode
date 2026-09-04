@@ -48,6 +48,7 @@ import { Image } from "@/image/image"
 import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
 import { Cause, Effect, Exit, Fiber, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
+import * as DateTime from "effect/DateTime"
 import { InstanceState } from "@/effect/instance-state"
 import { attach } from "@/effect/run-service"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
@@ -65,6 +66,9 @@ import { wakeBody } from "@/s2s/wake-registry"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
+import { errorMessage } from "@/util/error"
+import { SessionEvent } from "@opencode-ai/core/session/event"
+import { SessionMessage } from "@opencode-ai/schema/session-message"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -243,11 +247,12 @@ export const layer = Layer.effect(
       const msgs = onlySubtasks
         ? [{ role: "user" as const, content: subtasks.map((p) => p.prompt).join("\n") }]
         : yield* MessageV2.toModelMessagesEffect(context, mdl)
+      const system = LLM.buildSystem({ agent: ag, model: mdl, parts: [], user: firstInfo })
       const text = yield* llm
         .stream({
           agent: ag,
           user: firstInfo,
-          system: [],
+          system,
           small: true,
           tools: {},
           model: mdl,
@@ -1441,13 +1446,50 @@ export const layer = Layer.effect(
             yield* sessions.updateMessage(msg)
           })
 
+          const finalizeFailedAssistant = (error: unknown) =>
+            Effect.gen(function* () {
+              msg.error = MessageV2.fromError(error, { providerID: model.providerID })
+              msg.finish = "error"
+              msg.time.completed = Date.now()
+              yield* sessions.updateMessage(msg)
+              if (flags.experimentalEventSystem) {
+                const assistantMessageID = SessionMessage.ID.create()
+                yield* events.publish(SessionEvent.Step.Started, {
+                  sessionID,
+                  assistantMessageID,
+                  agent: msg.agent,
+                  model: {
+                    id: ModelV2.ID.make(msg.modelID),
+                    providerID: ProviderV2.ID.make(msg.providerID),
+                    variant: ModelV2.VariantID.make(msg.variant ?? "default"),
+                  },
+                  timestamp: DateTime.makeUnsafe(msg.time.created),
+                })
+                yield* events.publish(SessionEvent.Step.Failed, {
+                  sessionID,
+                  assistantMessageID,
+                  error: { type: "unknown", message: errorMessage(error) },
+                  timestamp: DateTime.makeUnsafe(Date.now()),
+                })
+              }
+              yield* events.publish(Session.Event.Error, { sessionID, error: msg.error })
+              yield* status.set(sessionID, { type: "idle" })
+            })
+
           const handle = yield* processor
             .create({
               assistantMessage: msg,
               sessionID,
               model,
             })
-            .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
+            .pipe(
+              Effect.catchCauseIf(
+                (cause) => !Cause.hasInterruptsOnly(cause),
+                (cause) => finalizeFailedAssistant(Cause.squash(cause)).pipe(Effect.as(undefined)),
+              ),
+              Effect.onInterrupt(() => finalizeInterruptedAssistant),
+            )
+          if (!handle) break
 
           const outcome: "break" | "continue" = yield* Effect.gen(function* () {
             const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
@@ -1483,34 +1525,48 @@ export const layer = Layer.effect(
             if (step === 1)
               yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
 
-            yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
-
             const sparse = session.contextMode === "sparse"
             const reader: InstructionAudience.Reader = {
               role: session.parentID == null ? "main" : "subagent",
               agent: agent.name,
             }
-            const instructions = yield* (sparse
-              ? instruction.systemScoped("project", reader).pipe(Effect.orDie)
-              : instruction.system(reader).pipe(Effect.orDie))
-
-            const [env, modelMsgs] = yield* Effect.all([
+            const [env, instructions] = yield* Effect.all([
               sys.environment(model),
-              MessageV2.toModelMessagesEffect(msgs, model),
+              sparse
+                ? instruction.systemScoped("project", reader).pipe(Effect.orDie)
+                : instruction.system(reader).pipe(Effect.orDie),
             ])
 
+            // Sparse discards skills and MCP docs, so branch before building them rather than after.
             const [skills, mcpInstructions] = sparse
               ? ([undefined, undefined] as const)
               : yield* Effect.all([sys.skills(agent), sys.mcp(agent, session.permission)])
-
-            const system = [
-              ...env,
-              ...instructions,
-              ...(mcpInstructions ? [mcpInstructions] : []),
-              ...(skills ? [skills] : []),
-            ]
             const format = lastUser.format ?? { type: "text" as const }
-            if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+            const system = LLM.buildSystem({
+              agent,
+              model,
+              parts: [
+                ...env,
+                ...instructions,
+                ...(mcpInstructions ? [mcpInstructions] : []),
+                ...(skills ? [skills] : []),
+                ...(format.type === "json_schema" ? [STRUCTURED_OUTPUT_SYSTEM_PROMPT] : []),
+              ],
+              user: lastUser,
+            })
+            const header = system[0]
+            yield* plugin.trigger(
+              "experimental.chat.system.transform",
+              { sessionID, model },
+              { system },
+            )
+            LLM.rejoinSystemForCaching(system, header)
+            yield* plugin.trigger(
+              "experimental.chat.messages.transform",
+              { sessionID, model: { providerID: model.providerID, modelID: model.id } },
+              { messages: msgs },
+            )
+            const modelMsgs = yield* MessageV2.toModelMessagesEffect(msgs, model)
             const result = yield* handle.process({
               user: lastUser,
               agent,
@@ -1570,6 +1626,9 @@ export const layer = Layer.effect(
             }
             return "continue" as const
           }).pipe(
+            Effect.catchCauseIf((cause) => !Cause.hasInterruptsOnly(cause), (cause) =>
+              finalizeFailedAssistant(Cause.squash(cause)).pipe(Effect.as("break" as const)),
+            ),
             Effect.ensuring(instruction.clear(handle.message.id)),
             Effect.onInterrupt(() => finalizeInterruptedAssistant),
           )
