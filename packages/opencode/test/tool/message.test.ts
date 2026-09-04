@@ -80,6 +80,7 @@ type CapturedPrompt = {
 function stubOps(record?: (input: CapturedPrompt) => void): TaskPromptOps {
   return {
     cancel: () => Effect.void,
+    cancelRun: () => Effect.void,
     resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
     prompt: (input) =>
       Effect.sync(() => {
