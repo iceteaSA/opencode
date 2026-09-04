@@ -347,6 +347,7 @@ export type AssistantMessage = {
   time: {
     created: number
     completed?: number
+    firstToken?: number
   }
   error?:
     | ProviderAuthError
