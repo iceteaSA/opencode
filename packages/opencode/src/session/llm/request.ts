@@ -8,7 +8,6 @@ import type { Agent } from "@/agent/agent"
 import type { MessageV2 } from "../message-v2"
 import type { Provider } from "@/provider/provider"
 import { ProviderTransform } from "@/provider/transform"
-import { SystemPrompt } from "../system"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { Effect, Record } from "effect"
 import { jsonSchema, tool as aiTool, type ModelMessage, type Tool } from "ai"
@@ -16,6 +15,29 @@ import type { Plugin } from "@/plugin"
 import { mergeDeep } from "remeda"
 
 const USER_AGENT = `opencode/${InstallationVersion}`
+
+function isDeepSeekModel(model: Provider.Model) {
+  return [model.id, model.api.id, model.providerID].some((value) => value.toLowerCase().includes("deepseek"))
+}
+
+function appendDeepSeekDateContext(messages: ModelMessage[], model: Provider.Model) {
+  if (!isDeepSeekModel(model)) return messages
+  const target = messages.at(-1)
+  if (!target || target.role !== "user") return messages
+  const date = { type: "text" as const, text: `Today's date: ${new Date().toDateString()}` }
+  // Keep the volatile date off the system prefix so DeepSeek cache reuse only
+  // changes at the trailing user turn boundary.
+  return [
+    ...messages.slice(0, -1),
+    {
+      ...target,
+      content:
+        typeof target.content === "string"
+          ? [{ type: "text" as const, text: target.content }, date]
+          : [...target.content, date],
+    },
+  ]
+}
 
 type PrepareInput = {
   readonly user: SessionV1.User
@@ -55,27 +77,7 @@ const mergeOptions = (target: Record<string, any>, source: Record<string, any> |
 
 export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: PrepareInput) {
   const isOpenaiOauth = input.provider.id === "openai" && input.auth?.type === "oauth"
-  const system = [
-    [
-      ...(input.agent.prompt ? [input.agent.prompt] : SystemPrompt.provider(input.model)),
-      ...input.system,
-      ...(input.user.system ? [input.user.system] : []),
-    ]
-      .filter((x) => x)
-      .join("\n"),
-  ]
-
-  const header = system[0]
-  yield* input.plugin.trigger(
-    "experimental.chat.system.transform",
-    { sessionID: input.sessionID, model: input.model },
-    { system },
-  )
-  if (system.length > 2 && system[0] === header) {
-    const rest = system.slice(1)
-    system.length = 0
-    system.push(header, rest.join("\n"))
-  }
+  const system = input.system
 
   const variant =
     !input.small && input.model.variants && input.user.model.variant
@@ -110,6 +112,7 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
           ),
           ...input.messages,
         ]
+  const modelMessages = appendDeepSeekDateContext(messages, input.model)
 
   const params = yield* input.plugin.trigger(
     "chat.params",
@@ -180,7 +183,7 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
 
   return {
     system,
-    messages,
+    messages: modelMessages,
     tools: Object.fromEntries(Object.entries(tools).toSorted(([a], [b]) => a.localeCompare(b))),
     params,
     messageTransformOptions: options,

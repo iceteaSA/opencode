@@ -165,10 +165,16 @@ const layer = Layer.effect(
     const continueAfterOverflowCompaction = (step: number) =>
       new TurnTransitionError({ _tag: "ContinueAfterOverflowCompaction", step })
 
-    const loadSystemContext = (agent: AgentV2.Selection) =>
+    const isDeepSeekModel = (id: string) => id.toLowerCase().includes("deepseek")
+    const loadSystemContext = (agent: AgentV2.Selection, modelID: string) =>
       Effect.all([systemContext.load(), skillGuidance.load(agent), referenceGuidance.load()], {
         concurrency: "unbounded",
-      }).pipe(Effect.map(SystemContext.combine))
+      }).pipe(
+        Effect.map(SystemContext.combine),
+        Effect.map((context) =>
+          isDeepSeekModel(modelID) ? SystemContext.omit(context, [SystemContext.Key.make("core/date")]) : context,
+        ),
+      )
 
     const runTurnAttempt = Effect.fn("SessionRunner.runTurn")(function* (
       sessionID: SessionSchema.ID,
@@ -180,7 +186,8 @@ const layer = Layer.effect(
       if (session.location.directory !== location.directory || session.location.workspaceID !== location.workspaceID)
         return yield* Effect.interrupt
       const agent = yield* agents.select(session.agent)
-      const initialized = yield* SessionContextEpoch.initialize(db, loadSystemContext(agent), session.id)
+      const model = yield* models.resolve(session)
+      const initialized = yield* SessionContextEpoch.initialize(db, loadSystemContext(agent, model.id), session.id)
       const toolFibers = yield* FiberSet.make<void, ToolOutputStore.Error>()
       let needsContinuation = false
       let currentStep = step
@@ -195,8 +202,7 @@ const layer = Layer.effect(
         if (promoted > 0) currentStep = 1
       }
       const system =
-        initialized ?? (yield* SessionContextEpoch.prepare(db, events, loadSystemContext(agent), session.id))
-      const model = yield* models.resolve(session)
+        initialized ?? (yield* SessionContextEpoch.prepare(db, events, loadSystemContext(agent, model.id), session.id))
       const entries = yield* SessionHistory.entriesForRunner(db, session.id, system.baselineSeq)
       const context = entries.map((entry) => entry.message)
       const isLastStep = agent.info?.steps !== undefined && currentStep >= agent.info.steps
