@@ -37,9 +37,6 @@ export interface TaskPromptOps {
 export const Event = {
   Completed: TaskEvent.Completed,
 }
-
-
-
 const id = "task"
 const BACKGROUND_DESCRIPTION = [
   "Background mode: background=true launches the subagent asynchronously and returns immediately.",
@@ -311,7 +308,7 @@ export const TaskTool = Tool.define(
         )
       }
 
-      const maxChildren = (cfg as ConfigV1.Info & { subagent_max_children?: number }).subagent_max_children ?? 32
+      const maxChildren = cfg.subagent_max_children ?? 32
 
       const modelOverride = params.model
       const overrideModel = modelOverride === undefined ? undefined : yield* parseModelOverride(modelOverride)
@@ -332,7 +329,6 @@ export const TaskTool = Tool.define(
           },
         })
       }
-
       if (!ctx.extra?.bypassAgentCheck) {
         yield* ctx.ask({
           permission: id,
