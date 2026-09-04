@@ -13,6 +13,7 @@ import { withTransientReadRetry } from "@/util/effect-http-client"
 import { Global } from "@opencode-ai/core/global"
 import type { MessageV2 } from "./message-v2"
 import type { MessageID } from "./schema"
+import { InstructionAudience } from "./instruction-audience"
 
 function extract(messages: SessionV1.WithParts[]) {
   const paths = new Set<string>()
@@ -34,14 +35,18 @@ function extract(messages: SessionV1.WithParts[]) {
 export interface Interface {
   readonly clear: (messageID: MessageID) => Effect.Effect<void>
   readonly systemPaths: () => Effect.Effect<Set<string>, FSUtil.Error>
-  readonly system: () => Effect.Effect<string[], FSUtil.Error>
-  readonly systemScoped: (scope: "all" | "project") => Effect.Effect<string[], FSUtil.Error>
+  readonly system: (reader: InstructionAudience.Reader) => Effect.Effect<string[], FSUtil.Error | InstructionAudience.AudienceError>
+  readonly systemScoped: (
+    scope: "all" | "project",
+    reader: InstructionAudience.Reader,
+  ) => Effect.Effect<string[], FSUtil.Error | InstructionAudience.AudienceError>
   readonly find: (dir: string) => Effect.Effect<string | undefined, FSUtil.Error>
   readonly resolve: (
     messages: SessionV1.WithParts[],
     filepath: string,
     messageID: MessageID,
-  ) => Effect.Effect<{ filepath: string; content: string }[], FSUtil.Error>
+    reader: InstructionAudience.Reader,
+  ) => Effect.Effect<{ filepath: string; content: string }[], FSUtil.Error | InstructionAudience.AudienceError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Instruction") {}
@@ -169,13 +174,15 @@ export const layer: Layer.Layer<
       return tagged
     })
 
-    const system = Effect.fn("Instruction.system")(function* () {
-      return yield* buildSystem(scoped("all")(yield* systemTagged()))
+    const system = Effect.fn("Instruction.system")(function* (reader: InstructionAudience.Reader) {
+      return yield* buildSystem(reader, scoped("all")(yield* systemTagged()))
     })
 
-    const systemScoped = Effect.fn("Instruction.systemScoped")(function* (scope: "all" | "project") {
-      const tagged = yield* systemTagged()
-      return yield* buildSystem(scoped(scope)(tagged))
+    const systemScoped = Effect.fn("Instruction.systemScoped")(function* (
+      scope: "all" | "project",
+      reader: InstructionAudience.Reader,
+    ) {
+      return yield* buildSystem(reader, scoped(scope)(yield* systemTagged()))
     })
 
     function scoped(scope: "all" | "project") {
@@ -185,16 +192,42 @@ export const layer: Layer.Layer<
       }
     }
 
-    const buildSystem = Effect.fn("Instruction.buildSystem")(function* (tagged: TaggedEntry[]) {
+    const filterAudience = Effect.fnUntraced(function* (
+      filepath: string,
+      content: string,
+      reader: InstructionAudience.Reader,
+    ) {
+      return yield* Effect.try({
+        try: () => InstructionAudience.filter(filepath, content, reader),
+        catch: (error) => {
+          if (error instanceof InstructionAudience.AudienceError) return error
+          throw error
+        },
+      })
+    })
+
+    const buildSystem = Effect.fn("Instruction.buildSystem")(function* (
+      reader: InstructionAudience.Reader,
+      tagged: TaggedEntry[],
+    ) {
       const fileEntries = tagged.filter((e) => !e.isUrl)
       const urlEntries = tagged.filter((e) => e.isUrl)
-
       const files = yield* Effect.forEach(fileEntries.map((e) => e.path), read, { concurrency: 8 })
       const remote = yield* Effect.forEach(urlEntries.map((e) => e.path), fetch, { concurrency: 4 })
 
       return [
-        ...fileEntries.flatMap((entry, i) => (files[i] ? [`Instructions from: ${entry.path}\n${files[i]}`] : [])),
-        ...urlEntries.flatMap((entry, i) => (remote[i] ? [`Instructions from: ${entry.path}\n${remote[i]}`] : [])),
+        ...(yield* Effect.forEach(fileEntries, (entry, index) => {
+          if (!files[index]) return Effect.succeed([])
+          return filterAudience(entry.path, files[index], reader).pipe(
+            Effect.map((filtered) => filtered.include ? [`Instructions from: ${entry.path}\n${filtered.body}`] : []),
+          )
+        })).flat(),
+        ...(yield* Effect.forEach(urlEntries, (entry, index) => {
+          if (!remote[index]) return Effect.succeed([])
+          return filterAudience(entry.path, remote[index], reader).pipe(
+            Effect.map((filtered) => filtered.include ? [`Instructions from: ${entry.path}\n${filtered.body}`] : []),
+          )
+        })).flat(),
       ]
     })
 
@@ -210,6 +243,7 @@ export const layer: Layer.Layer<
       messages: SessionV1.WithParts[],
       filepath: string,
       messageID: MessageID,
+      reader: InstructionAudience.Reader,
     ) {
       const sys = yield* systemPaths()
       const already = extract(messages)
@@ -241,7 +275,10 @@ export const layer: Layer.Layer<
         set.add(found)
         const content = yield* read(found)
         if (content) {
-          results.push({ filepath: found, content: `Instructions from: ${found}\n${content}` })
+          const filtered = yield* filterAudience(found, content, reader)
+          if (filtered.include) {
+            results.push({ filepath: found, content: `Instructions from: ${found}\n${filtered.body}` })
+          }
         }
 
         current = path.dirname(current)
