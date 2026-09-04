@@ -336,6 +336,6 @@ describe("wake-on-message: real path (SessionPrompt.layer + real Messaging.enque
       }),
     // Generous timeout: the poll-wait alone is up to 5s (25 * 200ms); the two
     // real LLM turns (warm-up + post-wake) add setup slack.
-    15000,
+    30000,
   )
 })
