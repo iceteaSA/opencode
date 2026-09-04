@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "e6ecea79-5939-40bd-9e2d-606016753258",
+  "id": "f24bbc59-d5bb-42e4-889c-1eb07267665e",
   "prevIds": [
-    "b1dd5863-f1ea-4f16-8aac-0134c692891c"
+    "e6ecea79-5939-40bd-9e2d-606016753258"
   ],
   "ddl": [
     {
@@ -12,6 +12,10 @@
     },
     {
       "name": "data_migration",
+      "entityType": "tables"
+    },
+    {
+      "name": "message_diff",
       "entityType": "tables"
     },
     {
@@ -193,6 +197,26 @@
       "name": "time_completed",
       "entityType": "columns",
       "table": "data_migration"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "message_id",
+      "entityType": "columns",
+      "table": "message_diff"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "data",
+      "entityType": "columns",
+      "table": "message_diff"
     },
     {
       "type": "text",
@@ -1691,6 +1715,21 @@
     },
     {
       "columns": [
+        "message_id"
+      ],
+      "tableTo": "message",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_message_diff_message_id_message_id_fk",
+      "entityType": "fks",
+      "table": "message_diff"
+    },
+    {
+      "columns": [
         "active_account_id"
       ],
       "tableTo": "account",
@@ -1925,6 +1964,15 @@
       "nameExplicit": false,
       "name": "data_migration_pk",
       "table": "data_migration",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "message_id"
+      ],
+      "nameExplicit": false,
+      "name": "message_diff_pk",
+      "table": "message_diff",
       "entityType": "pks"
     },
     {
