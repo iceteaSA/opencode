@@ -1,5 +1,6 @@
 import { Effect, Option, Schema, Scope } from "effect"
 import * as Tool from "./tool"
+import { Identifier } from "@/id/id"
 import { Messaging } from "../messaging"
 import { Session } from "@/session/session"
 import { BackgroundJob } from "@/background/job"
@@ -316,11 +317,13 @@ export const writeMarker = (
     if (Option.isNone(messages)) return
     const { user: lastUser } = MessageV2.latest(messages.value)
     if (!lastUser) return
+    const created = Date.now()
+    const id = MessageID.ascending(Identifier.create("msg", "ascending", created))
     const msg: SessionV1.User = {
-      id: MessageID.ascending(),
+      id,
       sessionID: input.sessionID,
       role: "user",
-      time: { created: Date.now() },
+      time: { created },
       agent: lastUser.agent,
       model: lastUser.model,
     }
