@@ -547,6 +547,10 @@ export const TaskTool = Tool.define(
         reason?: string,
       ) {
         const currentParent = yield* sessions.get(ctx.sessionID)
+        const parentMessages = yield* sessions.messages({ sessionID: ctx.sessionID }).pipe(Effect.option)
+        if (Option.isNone(parentMessages)) return
+        const { user: lastUser } = MessageV2.latest(parentMessages.value)
+        if (!lastUser) return
         const child = yield* sessions.get(nextSession.id).pipe(Effect.option)
         const childVal = Option.getOrUndefined(child)
         const frameBody =
@@ -567,7 +571,11 @@ export const TaskTool = Tool.define(
           .prompt({
             sessionID: ctx.sessionID,
             agent: currentParent.agent ?? ctx.agent,
-            variant,
+            model: {
+              providerID: lastUser.model.providerID,
+              modelID: lastUser.model.modelID,
+            },
+            variant: lastUser.model.variant ?? variant,
             parts: [
               {
                 type: "text",
