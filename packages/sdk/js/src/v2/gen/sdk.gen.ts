@@ -3413,8 +3413,10 @@ export class Session2 extends HeyApiClient {
     parameters?: {
       directory?: string
       workspace?: string
+      id?: string
       parentID?: string
       title?: string
+      slug?: string
       agent?: string
       model?: {
         id: string
@@ -3437,8 +3439,10 @@ export class Session2 extends HeyApiClient {
           args: [
             { in: "query", key: "directory" },
             { in: "query", key: "workspace" },
+            { in: "body", key: "id" },
             { in: "body", key: "parentID" },
             { in: "body", key: "title" },
+            { in: "body", key: "slug" },
             { in: "body", key: "agent" },
             { in: "body", key: "model" },
             { in: "body", key: "metadata" },
