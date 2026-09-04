@@ -5,7 +5,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { BackgroundJob } from "@/background/job"
 import { Session } from "@/session/session"
 import { SESSION_SLUG_PATTERN } from "@/session/session"
-import { SessionID, MessageID } from "../session/schema"
+import { SessionID } from "../session/schema"
 import { MessageV2 } from "../session/message-v2"
 import { Agent } from "../agent/agent"
 import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
@@ -37,6 +37,9 @@ export interface TaskPromptOps {
 export const Event = {
   Completed: TaskEvent.Completed,
 }
+
+
+
 const id = "task"
 const BACKGROUND_DESCRIPTION = [
   "Background mode: background=true launches the subagent asynchronously and returns immediately.",
@@ -329,6 +332,7 @@ export const TaskTool = Tool.define(
           },
         })
       }
+
       if (!ctx.extra?.bypassAgentCheck) {
         yield* ctx.ask({
           permission: id,
@@ -493,7 +497,6 @@ export const TaskTool = Tool.define(
       }) {
         const parts = yield* ops.resolvePromptParts(params.prompt)
         const result = yield* ops.prompt({
-          messageID: MessageID.ascending(),
           sessionID: nextSession.id,
           model: {
             modelID: attempt.modelID,
@@ -741,23 +744,23 @@ export const TaskTool = Tool.define(
               yield* events.publish(Event.Completed, yield* completedPayload(nextSession.id, ctx.sessionID, "error", startedAt))
               return yield* Effect.fail(new Error(result.error || "Task failed"))
             }
-          if (result?.status === "cancelled") {
-            const aborted = yield* interrupt.terminal(nextSession.id)
-            yield* events.publish(Event.Completed, yield* completedPayload(nextSession.id, ctx.sessionID, "aborted", startedAt))
-            const outputText = result?.output ?? ""
-            return {
-              title: params.description,
-              metadata,
-              output:
-                completionMode === "terse"
-                  ? terseText(outputText, childResult, nextSession.id, childVal?.slug)
-                  : renderOutput({
-                      sessionID: nextSession.id,
-                      state: "aborted",
-                      summary: Option.isSome(aborted) ? `Aborted: ${aborted.value.reason}` : "Aborted",
-                      text: outputText,
-                    }) + childResultBlock(childResult),
-            }
+            if (result?.status === "cancelled") {
+              const aborted = yield* interrupt.terminal(nextSession.id)
+              yield* events.publish(Event.Completed, yield* completedPayload(nextSession.id, ctx.sessionID, "aborted", startedAt))
+              const outputText = result?.output ?? ""
+              return {
+                title: params.description,
+                metadata,
+                output:
+                  completionMode === "terse"
+                    ? terseText(outputText, childResult, nextSession.id, childVal?.slug)
+                    : renderOutput({
+                        sessionID: nextSession.id,
+                        state: "aborted",
+                        summary: Option.isSome(aborted) ? `Aborted: ${aborted.value.reason}` : "Aborted",
+                        text: outputText,
+                      }) + childResultBlock(childResult),
+              }
           }
           const aborted = yield* interrupt.terminal(nextSession.id)
           if (Option.isSome(aborted)) {
