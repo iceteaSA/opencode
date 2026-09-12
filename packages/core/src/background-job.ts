@@ -121,8 +121,13 @@ function snapshot(job: Active): Info {
 }
 
 function errorText(error: unknown) {
-  if (error instanceof Error) return error.message
-  return String(error)
+  if (error instanceof Error) {
+    if (typeof error.message === "string" && error.message.trim()) return error.message
+    if ("_tag" in error && typeof error._tag === "string" && error._tag.trim()) return error._tag
+    if (typeof error.name === "string" && error.name.trim()) return error.name
+  }
+  const text = String(error)
+  return text.trim() ? text : "Unknown error"
 }
 
 /**
@@ -337,10 +342,10 @@ export const make = Effect.gen(function* () {
               ...job,
               info: { ...job.info, metadata: { ...job.info.metadata, messaged: true } },
             }
-            return [
-              { info: snapshot(next), messaged: job.messaged },
-              new Map(jobs).set(id, next),
-            ] as readonly [MessageResult, Map<string, Active>]
+            return [{ info: snapshot(next), messaged: job.messaged }, new Map(jobs).set(id, next)] as readonly [
+              MessageResult,
+              Map<string, Active>,
+            ]
           }),
         )
         if (result.info && result.messaged) yield* Deferred.succeed(result.messaged, payload).pipe(Effect.ignore)
