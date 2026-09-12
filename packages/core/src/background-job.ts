@@ -342,10 +342,10 @@ export const make = Effect.gen(function* () {
               ...job,
               info: { ...job.info, metadata: { ...job.info.metadata, messaged: true } },
             }
-            return [
-              { info: snapshot(next), messaged: job.messaged },
-              new Map(jobs).set(id, next),
-            ] as readonly [MessageResult, Map<string, Active>]
+            return [{ info: snapshot(next), messaged: job.messaged }, new Map(jobs).set(id, next)] as readonly [
+              MessageResult,
+              Map<string, Active>,
+            ]
           }),
         )
         if (result.info && result.messaged) yield* Deferred.succeed(result.messaged, payload).pipe(Effect.ignore)
