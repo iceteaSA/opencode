@@ -676,7 +676,8 @@ export const RunCommand = effectCmd({
         }
         const sessionID = sess.id
         const isDuplicateError = createRunErrorDeduper()
-        const printedTextParts = new Set<string>()
+        const renderedPartIDs = new Set<string>()
+        const taskRunning = new Map<string, boolean>()
 
         function emit(type: string, data: Record<string, unknown>, source?: "session" | "request") {
           if (args.format === "json") {
@@ -694,24 +695,78 @@ export const RunCommand = effectCmd({
           return false
         }
 
-        function printUnseenTextParts(parts: Part[]) {
-          for (const part of parts) {
-            if (part.type !== "text" || printedTextParts.has(part.id)) continue
-            if (emit("text", { part })) {
-              printedTextParts.add(part.id)
-              continue
+        async function renderPart(part: Part) {
+          if (renderedPartIDs.has(part.id)) return
+
+          if (part.type === "tool") {
+            if (part.state.status === "completed" || part.state.status === "error") {
+              renderedPartIDs.add(part.id)
+              if (emit("tool_use", { part })) return
+              if (part.state.status === "completed") {
+                await tool(part)
+                return
+              }
+              await toolError(part)
+              UI.error(part.state.error)
+              return
             }
+
+            if (part.tool === "task" && part.state.status === "running" && args.format !== "json") {
+              if (taskRunning.get(part.id) === true) return
+              await tool(part)
+              taskRunning.set(part.id, true)
+            }
+            return
+          }
+
+          if (part.type === "step-start") {
+            renderedPartIDs.add(part.id)
+            emit("step_start", { part })
+            return
+          }
+
+          if (part.type === "step-finish") {
+            renderedPartIDs.add(part.id)
+            emit("step_finish", { part })
+            return
+          }
+
+          if (part.type === "text" && part.time?.end) {
+            renderedPartIDs.add(part.id)
+            if (emit("text", { part })) return
             const text = part.text.trim()
-            if (!text) continue
+            if (!text) return
             if (!process.stdout.isTTY) {
               process.stdout.write(text + EOL)
-              printedTextParts.add(part.id)
-              continue
+              return
             }
             UI.empty()
             UI.println(text)
             UI.empty()
-            printedTextParts.add(part.id)
+            return
+          }
+
+          if (part.type === "reasoning" && part.time?.end && thinking) {
+            renderedPartIDs.add(part.id)
+            if (emit("reasoning", { part })) return
+            const text = part.text.trim()
+            if (!text) return
+            const line = `Thinking: ${text}`
+            if (process.stdout.isTTY) {
+              UI.empty()
+              UI.println(`${UI.Style.TEXT_DIM}\u001b[3m${line}\u001b[0m${UI.Style.TEXT_NORMAL}`)
+              UI.empty()
+              return
+            }
+            process.stdout.write(line + EOL)
+          }
+        }
+
+        async function renderReply(client: OpencodeClient, parentID: string) {
+          const response = await client.session.messages({ sessionID })
+          for (const message of response.data ?? []) {
+            if (message.info.role !== "assistant" || message.info.parentID !== parentID) continue
+            for (const part of message.parts) await renderPart(part)
           }
         }
 
@@ -745,67 +800,7 @@ export const RunCommand = effectCmd({
             if (event.type === "message.part.updated") {
               const part = event.properties.part
               if (part.sessionID !== sessionID) continue
-
-              if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
-                if (emit("tool_use", { part })) continue
-                if (part.state.status === "completed") {
-                  await tool(part)
-                  continue
-                }
-                await toolError(part)
-                UI.error(part.state.error)
-              }
-
-              if (
-                part.type === "tool" &&
-                part.tool === "task" &&
-                part.state.status === "running" &&
-                args.format !== "json"
-              ) {
-                if (toggles.get(part.id) === true) continue
-                await tool(part)
-                toggles.set(part.id, true)
-              }
-
-              if (part.type === "step-start") {
-                if (emit("step_start", { part })) continue
-              }
-
-              if (part.type === "step-finish") {
-                if (emit("step_finish", { part })) continue
-              }
-
-              if (part.type === "text" && part.time?.end) {
-                if (emit("text", { part })) {
-                  printedTextParts.add(part.id)
-                  continue
-                }
-                const text = part.text.trim()
-                if (!text) continue
-                if (!process.stdout.isTTY) {
-                  process.stdout.write(text + EOL)
-                  printedTextParts.add(part.id)
-                  continue
-                }
-                UI.empty()
-                UI.println(text)
-                UI.empty()
-                printedTextParts.add(part.id)
-              }
-
-              if (part.type === "reasoning" && part.time?.end && thinking) {
-                if (emit("reasoning", { part })) continue
-                const text = part.text.trim()
-                if (!text) continue
-                const line = `Thinking: ${text}`
-                if (process.stdout.isTTY) {
-                  UI.empty()
-                  UI.println(`${UI.Style.TEXT_DIM}\u001b[3m${line}\u001b[0m${UI.Style.TEXT_NORMAL}`)
-                  UI.empty()
-                  continue
-                }
-                process.stdout.write(line + EOL)
-              }
+              await renderPart(part)
             }
 
             if (event.type === "session.error") {
@@ -887,7 +882,7 @@ export const RunCommand = effectCmd({
               return
             }
             await finish()
-            if (!args.attach) printUnseenTextParts(result.data.parts)
+            if (!args.attach) await renderReply(client, result.data.info.parentID)
             return
           }
 
@@ -905,7 +900,7 @@ export const RunCommand = effectCmd({
             return
           }
           await finish()
-          if (!args.attach) printUnseenTextParts(result.data.parts)
+          if (!args.attach) await renderReply(client, result.data.info.parentID)
           return
         }
 
