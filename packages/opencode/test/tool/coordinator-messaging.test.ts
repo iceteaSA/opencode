@@ -507,8 +507,12 @@ describe("runLoop coordinator inbox drain (Task 5)", () => {
               (p.metadata as { marker?: { kind?: string } } | undefined)?.marker?.kind === "inbox"),
         )
         expect(inboxPartsOnCancelMsg).toHaveLength(0)
-        // Sanity: the cancel user message has exactly 2 parts.
-        expect(cancelMsg.parts).toHaveLength(2)
+        // Sanity: the cancel user message has exactly 2 cancel parts. The date reminder is
+        // attached to the newest user message on the first turn of a day, so it may ride here too.
+        const cancelParts = cancelMsg.parts.filter(
+          (p) => !(p.type === "text" && p.text.startsWith("<system-reminder>Today's date is ")),
+        )
+        expect(cancelParts).toHaveLength(2)
       }),
   )
 
