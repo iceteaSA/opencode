@@ -5,6 +5,7 @@ import {
   deriveSubagents,
   latestSubagentTPS,
   recentSubagents,
+  subagentActivity,
 } from "../../src/feature-plugins/sidebar/subagents"
 
 const messages = [{ id: "message-1" }]
@@ -657,5 +658,218 @@ describe("latestSubagentTPS", () => {
       assistant({ finish: "error", output: 999, created: 5000, firstToken: 5100, completed: 6100 }),
     ]
     expect(latestSubagentTPS(messages)?.rate).toBe(200)
+  })
+})
+
+describe("sidebar subagent activity", () => {
+  const oneAssistant = [{ id: "m1", role: "assistant" } as unknown as Message]
+
+  test("running tool with title reports tool and title", () => {
+    const parts = [
+      {
+        type: "tool",
+        tool: "read",
+        state: { status: "running", title: "src/foo.ts", input: {}, time: { start: 0 } },
+      },
+    ] as unknown as Part[]
+    expect(subagentActivity(undefined, oneAssistant, () => parts)).toBe("read: src/foo.ts")
+  })
+
+  test("running tool without title falls back to the first available input target", () => {
+    const parts = [
+      {
+        type: "tool",
+        tool: "bash",
+        state: { status: "running", input: { command: "bun test" }, time: { start: 0 } },
+      },
+    ] as unknown as Part[]
+    expect(subagentActivity(undefined, oneAssistant, () => parts)).toBe("bash: bun test")
+  })
+
+  test("running tool without title or input target falls back to calling", () => {
+    const parts = [
+      {
+        type: "tool",
+        tool: "task",
+        state: { status: "running", input: {}, time: { start: 0 } },
+      },
+    ] as unknown as Part[]
+    expect(subagentActivity(undefined, oneAssistant, () => parts)).toBe("calling task")
+  })
+
+  test("retry status reports attempt count", () => {
+    const retry = { type: "retry" as const, attempt: 2, message: "boom", next: 0 }
+    expect(subagentActivity(retry, [], () => [])).toBe("retrying 2")
+  })
+
+  test("completed turn with no running part surfaces the latest completed tool", () => {
+    const parts = [
+      {
+        type: "tool",
+        tool: "edit",
+        state: { status: "completed", title: "src/foo.ts", input: {}, output: "", time: { start: 1, end: 2 } },
+      },
+    ] as unknown as Part[]
+    expect(subagentActivity(undefined, oneAssistant, () => parts)).toBe("edit: src/foo.ts")
+  })
+
+  test("in-progress reasoning stays quiet", () => {
+    const parts = [{ type: "reasoning", text: "...", time: { start: 0 } }] as unknown as Part[]
+    expect(subagentActivity(undefined, oneAssistant, () => parts)).toBeUndefined()
+  })
+
+  test("reasoning or text after a completed tool hides the finished tool", () => {
+    const read = {
+      type: "tool",
+      tool: "read",
+      state: { status: "completed", title: "old.ts", input: {}, output: "", time: { start: 1, end: 2 } },
+    }
+    const thinking = [read, { type: "reasoning", text: "...", time: { start: 3 } }] as unknown as Part[]
+    const writing = [read, { type: "text", text: "done", time: { start: 3, end: 4 } }] as unknown as Part[]
+    expect(subagentActivity(undefined, oneAssistant, () => thinking)).toBeUndefined()
+    expect(subagentActivity(undefined, oneAssistant, () => writing)).toBeUndefined()
+  })
+
+  test("newest part wins when an older message holds a running tool", () => {
+    const partsByMessage = (messageID: string) =>
+      messageID === "m1"
+        ? ([
+            {
+              type: "tool",
+              tool: "read",
+              state: { status: "running", title: "older.ts", input: {}, time: { start: 1 } },
+            },
+          ] as unknown as Part[])
+        : ([
+            {
+              type: "tool",
+              tool: "bash",
+              state: { status: "completed", title: "newer", input: {}, output: "", time: { start: 2, end: 3 } },
+            },
+          ] as unknown as Part[])
+    const messages = [
+      { id: "m1", role: "assistant" },
+      { id: "m2", role: "assistant" },
+    ] as unknown as Message[]
+    expect(subagentActivity(undefined, messages, partsByMessage)).toBe("bash: newer")
+  })
+
+  test("truncates long activity to roughly forty-eight characters", () => {
+    const long = "x".repeat(80)
+    const parts = [
+      {
+        type: "tool",
+        tool: "read",
+        state: { status: "running", title: long, input: {}, time: { start: 0 } },
+      },
+    ] as unknown as Part[]
+    const out = subagentActivity(undefined, oneAssistant, () => parts)!
+    expect(out.length).toBeLessThanOrEqual(48)
+    expect(out.endsWith("…")).toBe(true)
+  })
+
+  test("no activity returns undefined", () => {
+    expect(subagentActivity(undefined, [], () => [])).toBeUndefined()
+    expect(subagentActivity(undefined, oneAssistant, () => [])).toBeUndefined()
+  })
+})
+
+describe("sidebar active section stale-label probe", () => {
+  const partsById = (id: string, source: Map<string, Part[]>): Part[] => source.get(id) ?? []
+
+  test("a newer user message hides any older completed label", () => {
+    const older = { id: "old", role: "assistant" } as unknown as Message
+    const newer = { id: "new", role: "user" } as unknown as Message
+    const source = new Map<string, Part[]>([
+      [
+        "old",
+        [
+          {
+            type: "tool",
+            tool: "read",
+            state: {
+              status: "completed",
+              title: "old.ts",
+              input: {},
+              output: "",
+              time: { start: 1, end: 2 },
+            },
+          },
+        ] as unknown as Part[],
+      ],
+      ["new", [{ type: "text", text: "follow-up" } as unknown as Part]],
+    ])
+    const messages = [older, newer]
+    expect(subagentActivity({ type: "busy" as const }, messages, (id) => partsById(id, source))).toBeUndefined()
+  })
+
+  test("a newer pending tool reports the calling verb, not the older completed label", () => {
+    const older = { id: "old", role: "assistant" } as unknown as Message
+    const newer = { id: "new", role: "assistant" } as unknown as Message
+    const source = new Map<string, Part[]>([
+      [
+        "old",
+        [
+          {
+            type: "tool",
+            tool: "read",
+            state: {
+              status: "completed",
+              title: "old.ts",
+              input: {},
+              output: "",
+              time: { start: 1, end: 2 },
+            },
+          },
+        ] as unknown as Part[],
+      ],
+      [
+        "new",
+        [
+          {
+            type: "tool",
+            tool: "bash",
+            state: { status: "pending", input: {}, raw: "{}" },
+          },
+        ] as unknown as Part[],
+      ],
+    ])
+    const messages = [older, newer]
+    expect(subagentActivity({ type: "busy" as const }, messages, (id) => partsById(id, source))).toBe("calling bash")
+  })
+
+  test("a newer errored tool hides every older completed label", () => {
+    const older = { id: "old", role: "assistant" } as unknown as Message
+    const newer = { id: "new", role: "assistant" } as unknown as Message
+    const source = new Map<string, Part[]>([
+      [
+        "old",
+        [
+          {
+            type: "tool",
+            tool: "read",
+            state: {
+              status: "completed",
+              title: "old.ts",
+              input: {},
+              output: "",
+              time: { start: 1, end: 2 },
+            },
+          },
+        ] as unknown as Part[],
+      ],
+      [
+        "new",
+        [
+          {
+            type: "tool",
+            tool: "bash",
+            state: { status: "error", input: {}, error: "boom", time: { start: 3, end: 4 } },
+          },
+        ] as unknown as Part[],
+      ],
+    ])
+    const messages = [older, newer]
+    expect(subagentActivity({ type: "busy" as const }, messages, (id) => partsById(id, source))).toBeUndefined()
   })
 })

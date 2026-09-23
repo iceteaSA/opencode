@@ -68,28 +68,47 @@ function deriveEntries(
   return [...latestBySession.values(), ...pending]
 }
 
-export function deriveSubagents(
-  messages: ReadonlyArray<{ id: string }>,
-  getParts: (messageID: string) => ReadonlyArray<Part>,
-): SidebarSubagent[] {
-  return deriveEntries(messages, getParts).map((entry) => ({
-    description: entry.description,
-    status: entry.status,
-    session_id: entry.session_id,
-  }))
+const ACTIVITY_MAX = 48
+const ACTIVITY_INPUT_TARGETS = ["filePath", "path", "pattern", "command"] as const
+
+function inputTarget(input: Readonly<Record<string, unknown>> | undefined): string | undefined {
+  if (!input) return undefined
+  for (const key of ACTIVITY_INPUT_TARGETS) {
+    const value = input[key]
+    if (typeof value === "string" && value.length > 0) return value
+  }
+  return undefined
 }
 
-export function activeSubagents(
-  messages: ReadonlyArray<{ id: string }>,
+// Only the newest child message matters: a fresh user turn, a newer pending/error tool, or
+// reasoning/text written after a tool makes any older label stale, so we never fall back
+// across the boundary.
+export function subagentActivity(
+  status: SessionStatus | undefined,
+  messages: ReadonlyArray<Message>,
   getParts: (messageID: string) => ReadonlyArray<Part>,
-  getStatus: (sessionID: string) => SessionStatus | undefined,
-) {
-  return deriveSubagents(messages, getParts).flatMap((entry) => {
-    if (!entry.session_id) return entry.status === "active" || entry.status === "pending" ? [entry] : []
-
-    if (!isActiveStatus(getStatus(entry.session_id))) return []
-    return [{ ...entry, status: "active" as const }]
-  })
+): string | undefined {
+  if (status?.type === "retry") return Locale.truncate(`retrying ${status.attempt}`, ACTIVITY_MAX)
+  const latest = messages[messages.length - 1]
+  if (!latest || latest.role !== "assistant") return undefined
+  const parts = getParts(latest.id)
+  for (let p = parts.length - 1; p >= 0; p--) {
+    const part = parts[p]
+    if (part.type === "text" || part.type === "reasoning") return undefined
+    if (part.type !== "tool") continue
+    const state = part.state
+    if (state.status === "running") {
+      if (typeof state.title === "string" && state.title.length > 0)
+        return Locale.truncate(`${part.tool}: ${state.title}`, ACTIVITY_MAX)
+      const target = inputTarget(state.input)
+      if (target) return Locale.truncate(`${part.tool}: ${target}`, ACTIVITY_MAX)
+      return Locale.truncate(`calling ${part.tool}`, ACTIVITY_MAX)
+    }
+    if (state.status === "pending") return Locale.truncate(`calling ${part.tool}`, ACTIVITY_MAX)
+    if (state.status === "error") return undefined
+    if (state.status === "completed") return Locale.truncate(`${part.tool}: ${state.title}`, ACTIVITY_MAX)
+  }
+  return undefined
 }
 
 type SubagentTPSMessage =
@@ -112,6 +131,30 @@ export function latestSubagentTPS(messages: ReadonlyArray<SubagentTPSMessage>): 
     if (tps) return tps
   }
   return undefined
+}
+
+export function deriveSubagents(
+  messages: ReadonlyArray<{ id: string }>,
+  getParts: (messageID: string) => ReadonlyArray<Part>,
+): SidebarSubagent[] {
+  return deriveEntries(messages, getParts).map((entry) => ({
+    description: entry.description,
+    status: entry.status,
+    session_id: entry.session_id,
+  }))
+}
+
+export function activeSubagents(
+  messages: ReadonlyArray<{ id: string }>,
+  getParts: (messageID: string) => ReadonlyArray<Part>,
+  getStatus: (sessionID: string) => SessionStatus | undefined,
+) {
+  return deriveSubagents(messages, getParts).flatMap((entry) => {
+    if (!entry.session_id) return entry.status === "active" || entry.status === "pending" ? [entry] : []
+
+    if (!isActiveStatus(getStatus(entry.session_id))) return []
+    return [{ ...entry, status: "active" as const }]
+  })
 }
 
 // History ranks by the child's own last activity: a background dispatch's parent
@@ -181,15 +224,30 @@ export function recentSubagents(
   }))
 }
 
-function View(props: { api: TuiPluginApi; session_id: string }) {
+type ActiveRow = SidebarSubagent & { activity: string | undefined }
+
+export function View(props: { api: TuiPluginApi; session_id: string }) {
   const theme = () => props.api.theme.current
   const [historyOpen, setHistoryOpen] = createSignal(true)
-  const list = createMemo(() =>
+  const [activeOpen, setActiveOpen] = createSignal(true)
+  const list = createMemo<ActiveRow[]>(() =>
     activeSubagents(
       props.api.state.session.messages(props.session_id),
       (messageID) => props.api.state.part(messageID),
       props.api.state.session.status,
-    ),
+    ).flatMap((entry) => {
+      if (!entry.session_id) return [{ ...entry, activity: undefined }]
+      return [
+        {
+          ...entry,
+          activity: subagentActivity(
+            props.api.state.session.status(entry.session_id),
+            props.api.state.session.messages(entry.session_id),
+            (messageID) => props.api.state.part(messageID),
+          ),
+        },
+      ]
+    }),
   )
   const history = createMemo(() =>
     recentSubagents(
@@ -222,32 +280,46 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
       <box gap={1}>
         <Show when={list().length > 0}>
           <box>
-            <text fg={theme().text}>
-              <b>Subagents</b>
-            </text>
-            <For each={list()}>
-              {(item) => {
-                const navigate = item.session_id
-                  ? () => props.api.route.navigate("session", { sessionID: item.session_id })
-                  : undefined
-                const tps = createMemo(() =>
-                  item.session_id ? latestSubagentTPS(props.api.state.session.messages(item.session_id)) : undefined,
-                )
-                return (
-                  <box flexDirection="row" gap={1} onMouseUp={navigate}>
-                    <text flexShrink={0} style={{ fg: statusColor(item.status) }}>
-                      •
-                    </text>
-                    <text fg={theme().text} wrapMode="word">
-                      {item.description} <span style={{ fg: theme().textMuted }}>{statusLabel(item.status)}</span>
-                      <Show when={tps()}>
-                        <span style={{ fg: theme().textMuted }}> · {formatTPS(tps()!)}</span>
-                      </Show>
-                    </text>
-                  </box>
-                )
-              }}
-            </For>
+            <box flexDirection="row" gap={1} onMouseDown={() => list().length > 1 && setActiveOpen((x) => !x)}>
+              <Show when={list().length > 1}>
+                <text fg={theme().text}>{activeOpen() ? "▼" : "▶"}</text>
+              </Show>
+              <text fg={theme().text}>
+                <b>Subagents</b>
+                <Show when={!activeOpen()}>
+                  <span style={{ fg: theme().textMuted }}> ({list().length})</span>
+                </Show>
+              </text>
+            </box>
+            <Show when={list().length <= 1 || activeOpen()}>
+              <For each={list()}>
+                {(item) => {
+                  const navigate = item.session_id
+                    ? () => props.api.route.navigate("session", { sessionID: item.session_id })
+                    : undefined
+                  const tps = createMemo(() =>
+                    item.session_id ? latestSubagentTPS(props.api.state.session.messages(item.session_id)) : undefined,
+                  )
+                  return (
+                    <box flexDirection="row" gap={1} onMouseUp={navigate}>
+                      <text flexShrink={0} style={{ fg: statusColor(item.status) }}>
+                        •
+                      </text>
+                      <text fg={theme().text} wrapMode="word">
+                        {item.description}{" "}
+                        <span style={{ fg: theme().textMuted }}>
+                          {statusLabel(item.status)}
+                          {item.activity ? ` · ${item.activity}` : ""}
+                        </span>
+                        <Show when={tps()}>
+                          <span style={{ fg: theme().textMuted }}> · {formatTPS(tps()!)}</span>
+                        </Show>
+                      </text>
+                    </box>
+                  )
+                }}
+              </For>
+            </Show>
           </box>
         </Show>
         <Show when={history().length > 0}>
@@ -293,7 +365,7 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
 
 const tui: TuiPlugin = async (api) => {
   api.slots.register({
-    order: 150,
+    order: 600,
     slots: {
       sidebar_content(_ctx, props) {
         return <View api={api} session_id={props.session_id} />
