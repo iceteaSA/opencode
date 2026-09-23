@@ -54,6 +54,7 @@ const make = (options: Config) =>
       ? Statement.defaultTransforms(options.transformResultNames).array
       : undefined
 
+    const retryIfAutocommit = retryLocked(() => native.isTransaction)
     const run = (query: string, params: ReadonlyArray<unknown> = []) =>
       Effect.withFiber<Array<Record<string, unknown>>, SqlError>((fiber) => {
         const statement = native.prepare(query)
@@ -67,7 +68,7 @@ const make = (options: Config) =>
             }),
           )
         }
-      }).pipe(retryLocked)
+      }).pipe(retryIfAutocommit)
 
     const runValues = (query: string, params: ReadonlyArray<unknown> = []) =>
       Effect.withFiber<ReadonlyArray<ReadonlyArray<unknown>>, SqlError>((fiber) => {
@@ -85,7 +86,7 @@ const make = (options: Config) =>
             }),
           )
         }
-      }).pipe(retryLocked)
+      }).pipe(retryIfAutocommit)
 
     const connection = identity<SqliteConnection>({
       execute(query, params, transformRows) {
