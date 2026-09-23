@@ -50,6 +50,14 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`s2s_sent\` (
+          \`dedupe_key\` text PRIMARY KEY,
+          \`recipient_session_id\` text NOT NULL,
+          \`inbox_id\` text,
+          \`time_created\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`s2s_token\` (
           \`token\` text PRIMARY KEY,
           \`inviter_session_id\` text NOT NULL,
@@ -275,6 +283,7 @@ export default {
         );
       `)
       yield* tx.run(`CREATE INDEX \`s2s_inbox_target\` ON \`s2s_inbox\` (\`target_session_id\`,\`drained_at\`);`)
+      yield* tx.run(`CREATE INDEX \`s2s_sent_recipient\` ON \`s2s_sent\` (\`recipient_session_id\`,\`time_created\`);`)
       yield* tx.run(`CREATE UNIQUE INDEX \`event_aggregate_seq_idx\` ON \`event\` (\`aggregate_id\`,\`seq\`);`)
       yield* tx.run(`CREATE INDEX \`event_aggregate_type_seq_idx\` ON \`event\` (\`aggregate_id\`,\`type\`,\`seq\`);`)
       yield* tx.run(

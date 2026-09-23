@@ -46,3 +46,23 @@ export const S2SAllowTable = sqliteTable(
   },
   (table) => [primaryKey({ columns: [table.session_id, table.allowed_session_id] })],
 )
+
+// Durable dedupe ledger for cross-process s2s sends. A row is inserted
+// at the same time as the s2s_inbox row, keyed by sha256(sender +
+// NUL + recipient + NUL + body). A second send whose key falls within
+// the dedupe window (10 minutes) is rejected at insert without writing
+// a new inbox row — making the `s2s msg` tool safe to retry after a
+// lost tool-result return. The s2s_inbox table cannot back this
+// because successful delivery hard-deletes the inbox row; the dedup
+// ledger is keyed by content, not by inbox id, so it outlives the
+// inbox row it paired with.
+export const S2SSentTable = sqliteTable(
+  "s2s_sent",
+  {
+    dedupe_key: text().primaryKey(),
+    recipient_session_id: text().notNull(),
+    inbox_id: text(),
+    time_created: integer().notNull(),
+  },
+  (table) => [index("s2s_sent_recipient").on(table.recipient_session_id, table.time_created)],
+)

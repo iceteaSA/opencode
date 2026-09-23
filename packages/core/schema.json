@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "f24bbc59-d5bb-42e4-889c-1eb07267665e",
+  "id": "a518187f-cc90-4089-b233-81aa2e3959f0",
   "prevIds": [
-    "e6ecea79-5939-40bd-9e2d-606016753258"
+    "f24bbc59-d5bb-42e4-889c-1eb07267665e"
   ],
   "ddl": [
     {
@@ -24,6 +24,10 @@
     },
     {
       "name": "s2s_inbox",
+      "entityType": "tables"
+    },
+    {
+      "name": "s2s_sent",
       "entityType": "tables"
     },
     {
@@ -317,6 +321,46 @@
       "name": "time_created",
       "entityType": "columns",
       "table": "s2s_inbox"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "dedupe_key",
+      "entityType": "columns",
+      "table": "s2s_sent"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "recipient_session_id",
+      "entityType": "columns",
+      "table": "s2s_sent"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "inbox_id",
+      "entityType": "columns",
+      "table": "s2s_sent"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "s2s_sent"
     },
     {
       "type": "text",
@@ -1986,6 +2030,15 @@
     },
     {
       "columns": [
+        "dedupe_key"
+      ],
+      "nameExplicit": false,
+      "name": "s2s_sent_pk",
+      "table": "s2s_sent",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
         "token"
       ],
       "nameExplicit": false,
@@ -2136,6 +2189,24 @@
       "name": "s2s_inbox_target",
       "entityType": "indexes",
       "table": "s2s_inbox"
+    },
+    {
+      "columns": [
+        {
+          "value": "recipient_session_id",
+          "isExpression": false
+        },
+        {
+          "value": "time_created",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "s2s_sent_recipient",
+      "entityType": "indexes",
+      "table": "s2s_sent"
     },
     {
       "columns": [

@@ -20,6 +20,7 @@ Commands:
 Usage notes:
 - The token TTL is 10 minutes; a token used after that is rejected.
 - `msg` is bounded two ways, both surfacing as a visible `AbuseError` (never a silent drop): a DURABLE recipient undelivered-row cap (50 — a DB count that holds across restarts and processes; delivered rows are deleted, so this is the real cross-process abuse bound), and a SOFT per-process outbound throttle (~50/hour/sender) that only catches a runaway loop in one process and resets on restart — do not rely on it as a security boundary.
+- Retries are safe: an identical resend to the same recipient within 10 minutes is deduped at insert and reported as already sent (with the original inbox id); nothing reaches the recipient twice.
 - Body length is capped at 16000 characters; longer bodies are rejected before delivery.
 - Consent is checked against the durable s2s_allow table (session_id based): you can only `msg` a peer you have invited+accepted. An un-consented target is rejected with a clear error. This works the same whether the peer is in this process or another, and survives a restart.
 - A one-directional consent entry is anomalous; a normal invite/accept pair has both directions.
