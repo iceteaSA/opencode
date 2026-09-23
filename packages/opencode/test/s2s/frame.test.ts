@@ -19,6 +19,7 @@
 // Mirrors the `makeRunLoopLayer` factory + `runLoopIt.instance` pattern from
 // `test/s2s/wakeup-spike.test.ts` and `test/s2s/poller.test.ts`.
 
+import { EffectFlock } from '@opencode-ai/core/util/effect-flock';
 import { afterEach, describe, expect } from "bun:test"
 import { Effect, Layer } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -135,7 +136,7 @@ const lspStub = Layer.succeed(
 )
 
 const statusNode = LayerNode.make({ service: SessionStatus.Service, layer: SessionStatus.layer, deps: [EventV2Bridge.node] })
-const runStateNode = LayerNode.make({ service: SessionRunState.Service, layer: SessionRunState.layer, deps: [BackgroundJob.node, statusNode] })
+const runStateNode = LayerNode.make({ service: SessionRunState.Service, layer: SessionRunState.layer, deps: [BackgroundJob.node, statusNode, EffectFlock.node] })
 
 const providerCfgFor = (url: string): Partial<ConfigV1.Info> => ({
   provider: {

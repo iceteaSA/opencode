@@ -25,6 +25,7 @@ import { Filesystem } from "@/util/filesystem"
 import { createOpencodeClient, type OpencodeClient, type ToolPart } from "@opencode-ai/sdk/v2"
 import { FormatError, FormatUnknownError } from "../error"
 import { INTERACTIVE_INPUT_ERROR, resolveInteractiveStdin } from "./run/runtime.stdin"
+import { createRunErrorDeduper } from "./run-error"
 
 type ModelInput = Parameters<OpencodeClient["session"]["prompt"]>[0]["model"]
 
@@ -674,9 +675,11 @@ export const RunCommand = effectCmd({
           process.exit(1)
         }
         const sessionID = sess.id
+        const isDuplicateError = createRunErrorDeduper()
 
-        function emit(type: string, data: Record<string, unknown>) {
+        function emit(type: string, data: Record<string, unknown>, source?: "session" | "request") {
           if (args.format === "json") {
+            if (type === "error" && isDuplicateError(data.error, source ?? "request")) return true
             process.stdout.write(
               JSON.stringify({
                 type,
@@ -786,7 +789,7 @@ export const RunCommand = effectCmd({
                 err = String(props.error.data.message)
               }
               error = error ? error + EOL + err : err
-              if (emit("error", { error: props.error })) continue
+              if (emit("error", { error: props.error }, "session")) continue
               UI.error(err)
             }
 
@@ -852,7 +855,7 @@ export const RunCommand = effectCmd({
               variant: args.variant,
             })
             if (result.error) {
-              if (!emit("error", { error: result.error })) UI.error(formatRunError(result.error))
+              if (!emit("error", { error: result.error }, "request")) UI.error(formatRunError(result.error))
               process.exitCode = 1
               return
             }
@@ -869,7 +872,7 @@ export const RunCommand = effectCmd({
             parts: [...files, { type: "text", text: message }],
           })
           if (result.error) {
-            if (!emit("error", { error: result.error })) UI.error(formatRunError(result.error))
+            if (!emit("error", { error: result.error }, "request")) UI.error(formatRunError(result.error))
             process.exitCode = 1
             return
           }
