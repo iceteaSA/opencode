@@ -3,15 +3,17 @@ import { InstanceState } from "@/effect/instance-state"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Runner } from "@/effect/runner"
 import { BackgroundJob } from "@/background/job"
-import { Effect, Latch, Layer, Scope, Context } from "effect"
+import { Context, Effect, Latch, Layer, Option, Scope } from "effect"
 import { Session } from "./session"
 import { SessionID } from "./schema"
 import { SessionStatus } from "./status"
+import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 
 export interface Interface {
   readonly assertNotBusy: (sessionID: SessionID) => Effect.Effect<void, Session.BusyError>
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly cancelRun: (sessionID: SessionID) => Effect.Effect<void>
+  readonly owns: (sessionID: SessionID) => Effect.Effect<boolean>
   readonly ensureRunning: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
@@ -27,16 +29,22 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionRunState") {}
 
+export const LeaseTiming = Context.Reference("@opencode/SessionRunState.LeaseTiming", {
+  defaultValue: () => ({ minimum: 250, maximum: 2_000, warning: 60_000, repeat: 300_000 }),
+})
+
 export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const background = yield* BackgroundJob.Service
     const status = yield* SessionStatus.Service
+    const flock = yield* EffectFlock.Service
 
     const state = yield* InstanceState.make(
       Effect.fn("SessionRunState.state")(function* () {
         const scope = yield* Scope.Scope
         const runners = new Map<SessionID, Runner.Runner<SessionV1.WithParts>>()
+        const leases = new Map<SessionID, EffectFlock.Held>()
         yield* Effect.addFinalizer(
           Effect.fnUntraced(function* () {
             yield* Effect.forEach(runners.values(), (runner) => runner.cancel, {
@@ -46,7 +54,7 @@ export const layer = Layer.effect(
             runners.clear()
           }),
         )
-        return { runners, scope }
+        return { runners, leases, scope }
       }),
     )
 
@@ -100,12 +108,53 @@ export const layer = Layer.effect(
       yield* existing.cancel
     })
 
+    const owns = Effect.fn("SessionRunState.owns")(function* (sessionID: SessionID) {
+      const held = (yield* InstanceState.get(state)).leases.get(sessionID)
+      // No registered lease returns true on legacy paths; false only means this process lost its lease.
+      return held ? yield* held.verify : true
+    })
+
+    const lease = (sessionID: SessionID, work: Effect.Effect<SessionV1.WithParts>) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const data = yield* InstanceState.get(state)
+          const timing = yield* LeaseTiming
+          const key = `session-run:${sessionID}`
+          yield* status.set(sessionID, { type: "busy" })
+          const started = Date.now()
+          let delay = timing.minimum
+          let warningAt = started + timing.warning
+          while (true) {
+            const held = yield* flock.tryAcquire(key)
+            if (Option.isSome(held)) {
+              data.leases.set(sessionID, held.value)
+              return yield* work.pipe(
+                Effect.ensuring(
+                  Effect.sync(() => {
+                    data.leases.delete(sessionID)
+                  }),
+                ),
+              )
+            }
+            if (Date.now() >= warningAt) {
+              const holder = yield* flock.holder(key)
+              yield* Effect.logWarning("session run lease wait", {
+                "session.id": sessionID,
+                holder: Option.isSome(holder) ? `${holder.value.pid}@${holder.value.hostname}` : "unknown",
+              })
+              warningAt = Date.now() + timing.repeat
+            }
+            yield* Effect.sleep(Math.min(timing.maximum, delay) * (0.75 + Math.random() * 0.5))
+            delay = Math.min(timing.maximum, delay * 1.7)
+          }
+        }),
+      )
     const ensureRunning = Effect.fn("SessionRunState.ensureRunning")(function* (
       sessionID: SessionID,
       onInterrupt: Effect.Effect<SessionV1.WithParts>,
       work: Effect.Effect<SessionV1.WithParts>,
     ) {
-      return yield* (yield* runner(sessionID, onInterrupt)).ensureRunning(work)
+      return yield* (yield* runner(sessionID, onInterrupt)).ensureRunning(lease(sessionID, work))
     })
 
     const startShell = Effect.fn("SessionRunState.startShell")(function* (
@@ -115,11 +164,11 @@ export const layer = Layer.effect(
       ready?: Latch.Latch,
     ) {
       return yield* (yield* runner(sessionID, onInterrupt))
-        .startShell(work, ready)
+        .startShell(lease(sessionID, work), ready)
         .pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
     })
 
-    return Service.of({ assertNotBusy, cancel, cancelRun, ensureRunning, startShell })
+    return Service.of({ assertNotBusy, cancel, cancelRun, owns, ensureRunning, startShell })
   }),
 )
 
@@ -161,6 +210,10 @@ function busyError(sessionID: SessionID) {
   return new Session.BusyError({ sessionID })
 }
 
-export const node = LayerNode.make({ service: Service, layer: layer, deps: [BackgroundJob.node, SessionStatus.node] })
+export const node = LayerNode.make({
+  service: Service,
+  layer: layer,
+  deps: [BackgroundJob.node, SessionStatus.node, EffectFlock.node],
+})
 
 export * as SessionRunState from "./run-state"

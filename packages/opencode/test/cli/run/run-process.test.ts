@@ -3,10 +3,23 @@
 // same process. See `test/lib/cli-process.ts` for the harness — each test uses
 // `opencode.run(message, opts?)` to spawn `bun src/index.ts run ...` with
 // `OPENCODE_CONFIG_CONTENT` providing the test provider config inline.
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
 import { reply } from "../../lib/llm-server"
 import { cliIt } from "../../lib/cli-process"
+import { createRunErrorDeduper } from "../../../src/cli/cmd/run-error"
+
+test("JSON error deduplication preserves distinct session errors and drops the request duplicate", () => {
+  const duplicate = createRunErrorDeduper()
+  expect(duplicate({ name: "ModelError", data: { message: "missing model" } }, "session")).toBe(false)
+  expect(duplicate({ name: "ToolError", data: { message: "tool failed" } }, "session")).toBe(false)
+  expect(duplicate({ name: "UnknownError", data: { message: "Unexpected server error." } }, "request")).toBe(true)
+
+  const reversed = createRunErrorDeduper()
+  const error = { name: "ModelError", data: { message: "missing model" } }
+  expect(reversed(error, "request")).toBe(false)
+  expect(reversed(error, "session")).toBe(true)
+})
 
 describe("opencode run (non-interactive subprocess)", () => {
   // Happy path: prompt completes, output reaches stdout, process exits 0.
