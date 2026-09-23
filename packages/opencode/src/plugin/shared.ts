@@ -194,10 +194,12 @@ export async function resolvePathPluginTarget(spec: string) {
 export async function checkPluginCompatibility(target: string, opencodeVersion: string, pkg?: PluginPackage) {
   if (!semver.valid(opencodeVersion) || semver.major(opencodeVersion) === 0) return
   // A compatibility gate that cannot read its input must not look like a pass.
-  const hit = pkg ?? (await readPluginPackage(target).catch((error) => {
-    const detail = error instanceof Error ? error.message : String(error)
-    throw new Error(`Unable to read plugin package.json at ${target}: ${detail}`)
-  }))
+  const hit =
+    pkg ??
+    (await readPluginPackage(target).catch((error) => {
+      const detail = error instanceof Error ? error.message : String(error)
+      throw new Error(`Unable to read plugin package.json at ${target}: ${detail}`)
+    }))
   const engines = hit.json.engines
   if (!isRecord(engines)) return
   const range = engines.opencode
