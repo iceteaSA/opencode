@@ -39,7 +39,7 @@ function isKimiFamily(model: Provider.Model) {
 }
 
 function isDeepSeekV4(model: Provider.Model) {
-  return model.api.id.toLowerCase().includes("deepseek-v4")
+  return !!model.api.id && model.api.id.toLowerCase().includes("deepseek-v4")
 }
 
 // Maps npm package to the key the AI SDK expects for providerOptions
