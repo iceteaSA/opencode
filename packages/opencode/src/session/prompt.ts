@@ -1308,6 +1308,7 @@ const layer = Layer.effect(
 
               handle.message.error = new SessionV1.OutputLengthError({}).toObject()
               yield* sessions.updateMessage(handle.message)
+              yield* events.publish(Session.Event.Error, { sessionID, error: handle.message.error })
               return "break" as const
             }
 

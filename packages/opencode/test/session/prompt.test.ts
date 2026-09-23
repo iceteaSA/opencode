@@ -692,15 +692,14 @@ it.instance("loop completes end-to-end recovery after a recoverable length finis
     const result = yield* prompt.loop({ sessionID: chat.id })
     expect(yield* llm.hits).toHaveLength(2)
     expect(result.info).toMatchObject({ role: "assistant", finish: "stop" })
-    expect(result.parts).toEqual(
-      expect.arrayContaining([expect.objectContaining({ type: "text", text: "complete" })]),
-    )
+    expect(result.parts).toEqual(expect.arrayContaining([expect.objectContaining({ type: "text", text: "complete" })]))
   }),
 )
 
 it.instance("loop surfaces reasoning-only length finish as an error", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
+    const events = yield* EventV2Bridge.Service
     const prompt = yield* SessionPrompt.Service
     const sessions = yield* Session.Service
     const chat = yield* sessions.create({ title: "Pinned" })
@@ -711,9 +710,22 @@ it.instance("loop surfaces reasoning-only length finish as an error", () =>
       parts: [{ type: "text", text: "hello" }],
     })
 
+    const errors: NonNullable<SessionV1.Assistant["error"]>[] = []
+    const expected = {
+      name: "MessageOutputLengthError",
+      data: {},
+    } satisfies NonNullable<SessionV1.Assistant["error"]>
+    const off = yield* events.listen((event) => {
+      if (event.type !== Session.Event.Error.type) return Effect.void
+      const data = event.data as typeof Session.Event.Error.data.Type
+      if (data.sessionID === chat.id && data.error) errors.push(data.error)
+      return Effect.void
+    })
+
     yield* llm.push(reply().reason("unfinished reasoning").length())
     const result = yield* prompt.loop({ sessionID: chat.id })
     const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: result.info.id })
+    yield* off
     expect(yield* llm.hits).toHaveLength(1)
     expect(result.info.role).toBe("assistant")
     if (result.info.role === "assistant") {
@@ -723,6 +735,7 @@ it.instance("loop surfaces reasoning-only length finish as an error", () =>
       })
       expect(stored.info).toMatchObject({ error: result.info.error })
     }
+    expect(errors).toContainEqual(expected)
     expect(result.parts).toEqual(
       expect.arrayContaining([expect.objectContaining({ type: "reasoning", text: "unfinished reasoning" })]),
     )
