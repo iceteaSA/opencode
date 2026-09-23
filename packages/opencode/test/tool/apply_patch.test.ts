@@ -1,5 +1,8 @@
 import { describe, expect } from "bun:test"
 import path from "path"
+import os from "os"
+import { realpathSync } from "fs"
+import { symlink } from "fs/promises"
 import * as fs from "fs/promises"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -130,6 +133,30 @@ describe("tool.apply_patch permission paths", () => {
       }),
     { git: true },
   )
+
+  if (process.platform !== "win32") {
+    it.instance(
+      "in-project link → outside directory uses absolute real path so deny rules match",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const outside = yield* Effect.promise(() =>
+            fs.mkdtemp(path.join(os.tmpdir(), "opencode-apply-patch-symlink-")),
+          )
+          const link = path.join(test.directory, "vendor")
+          yield* Effect.promise(() => symlink(outside, link))
+          const relPath = path.join("vendor", "added.txt")
+          const patchText = `*** Begin Patch\n*** Add File: ${relPath}\n+created\n*** End Patch`
+
+          const ruleset = Permission.fromConfig({ edit: { "*": "allow", [`${realpathSync(outside)}/**`]: "deny" } })
+          const exit = yield* execute({ patchText }, makeRulesCtx(ruleset).ctx).pipe(Effect.exit)
+          expect(exit._tag).toBe("Failure")
+          const realTarget = path.join(realpathSync(outside), "added.txt")
+          expect(yield* Effect.promise(() => fs.readFile(realTarget, "utf-8").catch(() => undefined))).toBeUndefined()
+        }),
+      { git: true },
+    )
+  }
 })
 
 describe("tool.apply_patch freeform", () => {

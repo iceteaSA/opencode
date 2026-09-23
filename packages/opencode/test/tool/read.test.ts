@@ -4,6 +4,8 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Cause, Effect, Exit, Layer, Stream } from "effect"
 import path from "path"
 import os from "os"
+import { realpathSync } from "fs"
+import { symlink } from "fs/promises"
 import * as fs from "fs/promises"
 import { Agent } from "../../src/agent/agent"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -225,6 +227,23 @@ describe("tool.read permission paths", () => {
       yield* Effect.promise(() => fs.rm(outer, { recursive: true, force: true }))
     }),
   )
+
+  if (process.platform !== "win32") {
+    it.live("in-project link → outside file uses the absolute real path so deny rules match", () =>
+      Effect.gen(function* () {
+        const outer = yield* tmpdirScoped()
+        const dir = yield* tmpdirScoped({ git: true })
+        const link = path.join(dir, "vendor")
+        yield* Effect.promise(() => symlink(outer, link))
+        const target = path.join(link, "secret.txt")
+        yield* put(target, "secret content")
+
+        const ruleset = Permission.fromConfig({ read: { "*": "allow", [`${outer}/**`]: "deny" } })
+        const exit = yield* exec(dir, { filePath: target }, askWithRules(ruleset)).pipe(Effect.exit)
+        expect(exit._tag).toBe("Failure")
+      }),
+    )
+  }
 })
 
 describe("tool.read external_directory permission", () => {

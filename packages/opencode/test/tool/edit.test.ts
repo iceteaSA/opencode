@@ -1,9 +1,13 @@
 import { afterEach, describe, expect } from "bun:test"
 import path from "path"
+import os from "os"
 import fs from "fs/promises"
+import { realpathSync } from "fs"
+import { symlink } from "fs/promises"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { EditTool } from "../../src/tool/edit"
+import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { disposeAllInstances, TestInstance } from "../fixture/fixture"
 import { LSP } from "@/lsp/lsp"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -11,6 +15,7 @@ import { Format } from "../../src/format"
 import { Agent } from "../../src/agent/agent"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
 import { Truncate } from "@/tool/truncate"
+import { Permission } from "../../src/permission"
 import { SessionID, MessageID } from "../../src/session/schema"
 import * as Tool from "../../src/tool/tool"
 import { testEffect } from "../lib/effect"
@@ -572,3 +577,64 @@ describe("tool.edit", () => {
     )
   })
 })
+
+const askWithRules = (ruleset: PermissionV1.Ruleset) => ({
+  ...ctx,
+  ask: (input: Parameters<Tool.Context["ask"]>[0]) =>
+    Effect.sync(() => {
+      if (input.permission === "external_directory") return
+      for (const pattern of input.patterns) {
+        const rule = Permission.evaluate(input.permission, pattern, ruleset)
+        if (rule.action !== "allow") throw new Error(`permission ${rule.action}: ${pattern}`)
+      }
+    }),
+})
+
+if (process.platform !== "win32") {
+  describe("tool.edit permission paths for symlinks", () => {
+    it.instance(
+      "new-file branch: in-project link → outside directory uses absolute real path so deny rules match",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const outside = yield* Effect.promise(() => fs.mkdtemp(path.join(os.tmpdir(), "opencode-edit-symlink-")))
+          const link = path.join(test.directory, "vendor")
+          yield* Effect.promise(() => symlink(outside, link))
+          const target = path.join(link, "brand-new.txt")
+
+          const ruleset = Permission.fromConfig({ edit: { "*": "allow", [`${realpathSync(outside)}/**`]: "deny" } })
+          const exit = yield* run(
+            { filePath: target, oldString: "", newString: "created" },
+            askWithRules(ruleset),
+          ).pipe(Effect.exit)
+          expect(exit._tag).toBe("Failure")
+          const realTarget = path.join(realpathSync(outside), "brand-new.txt")
+          expect(yield* Effect.promise(() => fs.readFile(realTarget, "utf-8").catch(() => undefined))).toBeUndefined()
+        }),
+      { git: true },
+    )
+
+    it.instance(
+      "existing-file branch: in-project link → outside file uses absolute real path so deny rules match",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const outside = yield* Effect.promise(() => fs.mkdtemp(path.join(os.tmpdir(), "opencode-edit-symlink-")))
+          const link = path.join(test.directory, "vendor")
+          yield* Effect.promise(() => symlink(outside, link))
+          const realTarget = path.join(outside, "existing.txt")
+          yield* Effect.promise(() => fs.writeFile(realTarget, "old content", "utf-8"))
+          const target = path.join(link, "existing.txt")
+
+          const ruleset = Permission.fromConfig({ edit: { "*": "allow", [`${realpathSync(outside)}/**`]: "deny" } })
+          const exit = yield* run(
+            { filePath: target, oldString: "old content", newString: "changed" },
+            askWithRules(ruleset),
+          ).pipe(Effect.exit)
+          expect(exit._tag).toBe("Failure")
+          expect(yield* Effect.promise(() => fs.readFile(realTarget, "utf-8"))).toBe("old content")
+        }),
+      { git: true },
+    )
+  })
+}
