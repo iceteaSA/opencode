@@ -43,6 +43,18 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 // constant for display.
 export const TOKEN_TTL_MS = 600_000
 
+// 10 minutes. Insert-time dedupe window for cross-process `s2s msg`.
+// The same body to the same recipient within this window is rejected
+// as a duplicate, making the tool safe to retry after a lost tool-
+// result return without redelivering to the recipient.
+export const DEDUPE_WINDOW_MS = 600_000
+
+// Per-call cap on rows pruned from s2s_sent by the dedupe transaction.
+// Bounded so a backlog cannot stall a single send; full-table cleanup
+// is a separate concern (the table is also pruned opportunistically
+// at every send, so growth is bounded by send rate × window).
+const DEDUPE_PRUNE_BATCH = 100
+
 // ──────────────────────────────────────────────────────────────────
 // Retry helpers — exported for unit-testing so concurrency behavior
 // can be verified without real database locking.
@@ -86,6 +98,16 @@ export class S2SStoreError extends Schema.TaggedErrorClass<S2SStoreError>()("S2S
   cause: Schema.Unknown,
 }) {}
 
+// Outcome of `tryEnqueueWithDedup`. The store returns a tagged result
+// rather than throwing so the tool layer can branch on the duplicate
+// path (which is a normal success result) without an error-channel
+// detour. `originalInboxId` is the inbox id the FIRST send produced; on
+// a successful insert it equals the freshly minted `inboxId`.
+export type EnqueueResult =
+  | { _tag: "inserted"; inboxId: string }
+  | { _tag: "duplicate"; originalInboxId: string }
+  | { _tag: "inbox_full" }
+
 export interface InboxRow {
   id: string
   targetSessionID: SessionID
@@ -126,6 +148,21 @@ export interface AllowRow {
 
 export interface Interface {
   readonly insertInbox: (row: NewInboxRow) => Effect.Effect<void, S2SStoreError>
+  // Atomic cross-process send: dedup check + INBOX_CAP check + inbox
+  // insert + dedup-record insert in ONE transaction (Bun's SQLite WAL
+  // serializes writers, so two concurrent sends racing on the same key
+  // see exactly one `inserted` and the rest `duplicate`).
+  readonly tryEnqueueWithDedup: (input: {
+    dedupeKey: string
+    sender: SessionID
+    target: SessionID
+    fromSlug: string | null
+    capsule: string
+    capsuleId: string
+    timeCreated: number
+    windowMs: number
+    inboxCap: number
+  }) => Effect.Effect<EnqueueResult, S2SStoreError>
   readonly claimForSessions: (ids: ReadonlyArray<SessionID>) => Effect.Effect<InboxRow[], S2SStoreError>
   readonly deleteInbox: (id: string) => Effect.Effect<void, S2SStoreError>
   readonly reapStale: (olderThan: number) => Effect.Effect<void, S2SStoreError>
@@ -211,21 +248,88 @@ export const layer = Layer.effect(
       )
     })
 
-    const claimForSessions: Interface["claimForSessions"] = Effect.fn("S2SStore.claimForSessions")(
-      function* (ids) {
-        if (ids.length === 0) return []
-        const claimed = yield* query(
-          db.all<InboxDbRow>(sql`
+    // Atomic dedupe + insert. The transaction holds a write lock on
+    // s2s_inbox and s2s_sent for its full duration, so concurrent
+    // fibers racing on the same dedupe_key see one `inserted` and the
+    // rest `duplicate` — even when the original row has already been
+    // delivered and deleted from s2s_inbox, the s2s_sent row outlives
+    // it. The inbox_cap check is inside the transaction so two
+    // concurrent sends at the cap cannot both pass the check.
+    const tryEnqueueWithDedup: Interface["tryEnqueueWithDedup"] = Effect.fn("S2SStore.tryEnqueueWithDedup")(
+      function* (input) {
+        const cutoff = input.timeCreated - input.windowMs
+        const result = yield* query(
+          db.transaction(
+            (tx) =>
+              Effect.gen(function* () {
+                const existing = yield* tx.get<{ inbox_id: string | null }>(sql`
+                  SELECT inbox_id FROM s2s_sent
+                  WHERE dedupe_key = ${input.dedupeKey}
+                    AND time_created > ${cutoff}
+                  LIMIT 1
+                `)
+                if (existing) {
+                  return {
+                    _tag: "duplicate" as const,
+                    originalInboxId: existing.inbox_id ?? input.capsuleId,
+                  }
+                }
+                const row = yield* tx.get<{ n: number }>(sql`
+                  SELECT COUNT(*) AS n FROM s2s_inbox
+                  WHERE target_session_id = ${input.target} AND drained_at IS NULL
+                `)
+                if ((row?.n ?? 0) >= input.inboxCap) {
+                  return { _tag: "inbox_full" as const }
+                }
+                // Opportunistically prune expired rows. Bounded by
+                // DEDUPE_PRUNE_BATCH so a backlog cannot stall a send.
+                yield* tx.run(sql`
+                  DELETE FROM s2s_sent
+                  WHERE time_created <= ${cutoff}
+                  ORDER BY time_created ASC
+                  LIMIT ${DEDUPE_PRUNE_BATCH}
+                `)
+                // If the dedupe key existed but was expired (the SELECT
+                // above filtered it out), its row is now gone — but a
+                // concurrent send at the same key may have inserted one
+                // between our SELECT and DELETE; remove any stale match
+                // explicitly so the PK INSERT below cannot collide.
+                yield* tx.run(sql`
+                  DELETE FROM s2s_sent WHERE dedupe_key = ${input.dedupeKey}
+                `)
+                yield* tx.run(sql`
+                  INSERT INTO s2s_inbox (id, target_session_id, from_session_id, from_slug, capsule, time_created)
+                  VALUES (${input.capsuleId}, ${input.target}, ${input.sender}, ${input.fromSlug}, ${input.capsule}, ${input.timeCreated})
+                `)
+                yield* tx.run(sql`
+                  INSERT INTO s2s_sent (dedupe_key, recipient_session_id, inbox_id, time_created)
+                  VALUES (${input.dedupeKey}, ${input.target}, ${input.capsuleId}, ${input.timeCreated})
+                `)
+                return { _tag: "inserted" as const, inboxId: input.capsuleId }
+              }),
+            { behavior: "immediate" },
+          ),
+        )
+        return result
+      },
+    )
+
+    const claimForSessions: Interface["claimForSessions"] = Effect.fn("S2SStore.claimForSessions")(function* (ids) {
+      if (ids.length === 0) return []
+      const claimed = yield* query(
+        db.all<InboxDbRow>(sql`
             UPDATE s2s_inbox
             SET drained_at = ${Date.now()}
-            WHERE target_session_id IN (${sql.join(ids.map((id) => sql`${id}`), sql`, `)})
+            WHERE target_session_id IN (${sql.join(
+              ids.map((id) => sql`${id}`),
+              sql`, `,
+            )})
               AND drained_at IS NULL
             RETURNING id, target_session_id, from_session_id, from_slug, capsule, time_created
           `),
-        )
-        return claimed.map(toInboxRow)
-      },
-    )
+      )
+      return claimed.map(toInboxRow)
+    })
 
     // Hard-delete a row once it has been successfully delivered into the
     // recipient's in-process inbox. This is what makes a *claimed* row
@@ -251,17 +355,15 @@ export const layer = Layer.effect(
       )
     })
 
-    const countUndelivered: Interface["countUndelivered"] = Effect.fn("S2SStore.countUndelivered")(
-      function* (target) {
-        const row = yield* query(
-          db.get<{ n: number }>(sql`
+    const countUndelivered: Interface["countUndelivered"] = Effect.fn("S2SStore.countUndelivered")(function* (target) {
+      const row = yield* query(
+        db.get<{ n: number }>(sql`
             SELECT COUNT(*) AS n FROM s2s_inbox
             WHERE target_session_id = ${target} AND drained_at IS NULL
           `),
-        )
-        return row?.n ?? 0
-      },
-    )
+      )
+      return row?.n ?? 0
+    })
 
     const insertToken: Interface["insertToken"] = Effect.fn("S2SStore.insertToken")(function* (row) {
       yield* query(
@@ -327,32 +429,31 @@ export const layer = Layer.effect(
     // the session table. A session row is always created BEFORE any s2s row
     // can reference it (synchronous at session creation), so NOT IN cannot
     // race-delete rows that belong to a live, newly created session.
-    const deleteOrphaned: Interface["deleteOrphaned"] = Effect.fn("S2SStore.deleteOrphaned")(
-      function* () {
-        yield* query(
-          db.run(sql`
+    const deleteOrphaned: Interface["deleteOrphaned"] = Effect.fn("S2SStore.deleteOrphaned")(function* () {
+      yield* query(
+        db.run(sql`
             DELETE FROM s2s_inbox
             WHERE target_session_id NOT IN (SELECT id FROM session)
           `),
-        )
-        yield* query(
-          db.run(sql`
+      )
+      yield* query(
+        db.run(sql`
             DELETE FROM s2s_allow
             WHERE session_id NOT IN (SELECT id FROM session)
                OR allowed_session_id NOT IN (SELECT id FROM session)
           `),
-        )
-        yield* query(
-          db.run(sql`
+      )
+      yield* query(
+        db.run(sql`
             DELETE FROM s2s_token
             WHERE inviter_session_id NOT IN (SELECT id FROM session)
           `),
-        )
-      },
-    )
+      )
+    })
 
     return {
       insertInbox,
+      tryEnqueueWithDedup,
       claimForSessions,
       deleteInbox,
       reapStale,

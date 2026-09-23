@@ -48,7 +48,7 @@ import { Effect, Option, Schema } from "effect"
 import * as Tool from "./tool"
 import { Messaging, AbuseError, INBOX_CAP, S2S_HOURLY_OUTBOUND_CAP } from "../messaging"
 import { Session } from "@/session/session"
-import { S2SStore, TOKEN_TTL_MS } from "@/s2s/store"
+import { S2SStore, TOKEN_TTL_MS, DEDUPE_WINDOW_MS } from "@/s2s/store"
 import { S2SCapsule, encodeCapsule } from "@/s2s/capsule"
 import { uuidv7 } from "@/s2s/uuidv7"
 import { SessionID } from "@/session/schema"
@@ -90,11 +90,7 @@ type Metadata = {
   peers?: Peer[]
 }
 
-export const S2STool = Tool.define<
-  typeof Parameters,
-  Metadata,
-  Messaging.Service | Session.Service | S2SStore.Service
->(
+export const S2STool = Tool.define<typeof Parameters, Metadata, Messaging.Service | Session.Service | S2SStore.Service>(
   "s2s",
   Effect.gen(function* () {
     const messaging = yield* Messaging.Service
@@ -139,8 +135,7 @@ export const S2STool = Tool.define<
         }
 
         case "accept": {
-          if (!params.token)
-            return yield* Effect.fail(new Error('s2s(command:"accept") requires a token'))
+          if (!params.token) return yield* Effect.fail(new Error('s2s(command:"accept") requires a token'))
           const claimed = yield* store.claimToken(params.token, ctx.sessionID)
           if (Option.isNone(claimed))
             return yield* Effect.fail(
@@ -168,8 +163,7 @@ export const S2STool = Tool.define<
         case "msg": {
           if (!params.target)
             return yield* Effect.fail(new Error('s2s(command:"msg") requires target=<peer-session-id>'))
-          if (!params.body)
-            return yield* Effect.fail(new Error('s2s(command:"msg") requires body="..."'))
+          if (!params.body) return yield* Effect.fail(new Error('s2s(command:"msg") requires body="..."'))
           if (params.body.length > MAX_BODY_LENGTH)
             return yield* Effect.fail(
               new Error(`s2s body exceeds maximum length of ${MAX_BODY_LENGTH} characters (got ${params.body.length})`),
@@ -178,8 +172,7 @@ export const S2STool = Tool.define<
           // Addressing is by session_id. The target string IS the peer's
           // SessionID — no slug resolution (session.slug is not unique).
           const targetID = SessionID.make(params.target)
-          if (targetID === ctx.sessionID)
-            return yield* Effect.fail(new Error("s2s msg: cannot send to self"))
+          if (targetID === ctx.sessionID) return yield* Effect.fail(new Error("s2s msg: cannot send to self"))
 
           // Consent: the durable s2s_allow table (session_id based) is the
           // single authority. `isAllowed(me, target)` is true iff we
@@ -227,9 +220,16 @@ export const S2STool = Tool.define<
             timestamp: Date.now(),
             body: params.body,
           }
-          yield* enqueueExternal({ store, target: targetID, fromSlug: me.slug, capsule }).pipe(
+          const outcome = yield* enqueueExternal({ store, target: targetID, fromSlug: me.slug, capsule }).pipe(
             Effect.catchTag("Messaging.AbuseError", (e) => Effect.fail(new Error(e.detail))),
           )
+          if (outcome._tag === "duplicate") {
+            return {
+              title: `Already sent to ${params.target}`,
+              metadata: { command: "msg", target: params.target },
+              output: `Already sent within the last ${DEDUPE_WINDOW_MS / 60_000} minutes (id=${outcome.originalInboxId}); not re-queued.`,
+            }
+          }
           return {
             title: `Sent to ${params.target}`,
             metadata: { command: "msg", target: params.target },
@@ -339,11 +339,13 @@ export const S2STool = Tool.define<
 )
 
 // Module-local cross-process enqueue. See the file-level comment for
-// why this lives here instead of on Messaging.Interface. Same
-// contract as the spec: bumpOutbound first (over-cap → AbuseError),
-// per-sender id dedup window, recipient undelivered-row cap
-// (INBOX_CAP → AbuseError "inbox full"). Does NOT touch TREE_MESSAGE_CAP.
-const enqueueExternalDedup = new Map<SessionID, string[]>()
+// why this lives here instead of on Messaging.Interface. Contract:
+// SOFT per-process outbound throttle (over-cap → AbuseError) is
+// checked first, then durable dedup (s2s_sent table) + recipient
+// undelivered-row cap (INBOX_CAP → AbuseError "inbox full") in one
+// atomic write-lock-held transaction. The throttle counter is bumped
+// ONLY on a fresh insert — the duplicate / inbox-full paths do not
+// consume budget. Does NOT touch TREE_MESSAGE_CAP.
 const enqueueExternalBumpOutbound = new Map<SessionID, { hour: number; count: number }>()
 
 // Global cap on sender entries per Map to prevent unbounded growth
@@ -359,6 +361,20 @@ const evictIfNeeded = <V>(map: Map<SessionID, V>, max: number) => {
   }
 }
 
+// sha256(sender + NUL + recipient + NUL + body). The separator must
+// not appear in the session ids, so the boundaries between sender,
+// recipient, and body are unambiguous (NUL is the only byte that
+// cannot occur inside a `ses_` id). The key is content-addressed —
+// different bodies, different recipients, or a body sent after the
+// dedupe window all produce different keys and are sent normally.
+const dedupeKeyFor = async (sender: SessionID, recipient: SessionID, body: string): Promise<string> => {
+  const data = new TextEncoder().encode(`${sender}\u0000${recipient}\u0000${body}`)
+  const digest = await crypto.subtle.digest("SHA-256", data)
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
+}
+
 const enqueueExternal = Effect.fn("S2STool.enqueueExternal")(function* (input: {
   store: S2SStore.Interface
   target: SessionID
@@ -372,37 +388,43 @@ const enqueueExternal = Effect.fn("S2STool.enqueueExternal")(function* (input: {
   // across processes — a determined sender can exceed it by restarting or
   // running multiple processes. It exists only to catch a runaway loop in
   // the common single-process case. The DURABLE, cross-process abuse bound
-  // is the recipient's INBOX_CAP below (countUndelivered is a DB COUNT, and
-  // delivered rows are hard-deleted, so a recipient can never accumulate
-  // more than INBOX_CAP undelivered rows regardless of sender restarts).
-  // Wall-clock hour bucket; resets on the next hour boundary.
-  const hour = Math.floor(Date.now() / 3_600_000)
+  // is the recipient's INBOX_CAP below (enforced inside the same
+  // transaction as the dedupe check + insert, so two concurrent sends
+  // racing at the cap cannot both pass the gate). Wall-clock hour bucket;
+  // resets on the next hour boundary.
+  const now = Date.now()
+  const hour = Math.floor(now / 3_600_000)
   const existing = enqueueExternalBumpOutbound.get(sender)
   const current = existing && existing.hour === hour ? existing : { hour, count: 0 }
   if (current.count >= S2S_HOURLY_OUTBOUND_CAP)
     return yield* new AbuseError({
       detail: `s2s hourly outbound cap (${S2S_HOURLY_OUTBOUND_CAP}) reached for this session`,
     })
-  enqueueExternalBumpOutbound.set(sender, { hour: current.hour, count: current.count + 1 })
-  evictIfNeeded(enqueueExternalBumpOutbound, MAX_SENDER_ENTRIES)
-  // Per-sender id dedup. Process-local LRU; a retried envelope
-  // (same UUIDv7 id) is a silent no-op.
-  const seen = enqueueExternalDedup.get(sender) ?? []
-  if (seen.includes(input.capsule.id)) return
-  // Recipient undelivered-row cap.
-  const n = yield* store.countUndelivered(input.target)
-  if (n >= INBOX_CAP)
+  // Durable insert-time dedupe: one transaction covers the dedup check,
+  // the inbox-cap check, the s2s_inbox insert, and the s2s_sent record.
+  // A duplicate return takes the early-out path below and does NOT
+  // consume the per-process outbound budget or the recipient's cap.
+  const dedupeKey = yield* Effect.promise(() => dedupeKeyFor(sender, input.target, input.capsule.body))
+  const result = yield* store.tryEnqueueWithDedup({
+    dedupeKey,
+    sender,
+    target: input.target,
+    fromSlug: input.fromSlug,
+    capsule: encodeCapsule(input.capsule),
+    capsuleId: input.capsule.id,
+    timeCreated: now,
+    windowMs: DEDUPE_WINDOW_MS,
+    inboxCap: INBOX_CAP,
+  })
+  if (result._tag === "duplicate") {
+    return { _tag: "duplicate" as const, originalInboxId: result.originalInboxId }
+  }
+  if (result._tag === "inbox_full") {
     return yield* new AbuseError({
       detail: `recipient s2s inbox cap (${INBOX_CAP}) reached`,
     })
-  yield* store.insertInbox({
-    id: input.capsule.id,
-    targetSessionID: input.target,
-    fromSessionID: sender,
-    fromSlug: input.fromSlug,
-    capsule: encodeCapsule(input.capsule),
-    timeCreated: Date.now(),
-  })
-  enqueueExternalDedup.set(sender, [...seen, input.capsule.id].slice(-100))
-  evictIfNeeded(enqueueExternalDedup, MAX_SENDER_ENTRIES)
+  }
+  enqueueExternalBumpOutbound.set(sender, { hour: current.hour, count: current.count + 1 })
+  evictIfNeeded(enqueueExternalBumpOutbound, MAX_SENDER_ENTRIES)
+  return { _tag: "inserted" as const, inboxId: result.inboxId }
 })

@@ -171,7 +171,32 @@ export const layer: Layer.Layer<
         }
       }
 
-      return tagged
+      // One file can be reached under different lexical paths (e.g. a project directory
+      // that is also the global config directory, or through a symlink). Collapse file
+      // entries by realpath, keeping the first occurrence's position and path string.
+      // A collapsed entry keeps "project" origin when any occurrence had it, so sparse
+      // sessions (systemScoped("project")) still see the file.
+      const seen = new Map<string, number>()
+      const collapsed: TaggedEntry[] = []
+      for (const entry of tagged) {
+        if (entry.isUrl) {
+          collapsed.push(entry)
+          continue
+        }
+        const real = yield* fs.realPath(entry.path).pipe(Effect.catch(() => Effect.succeed(entry.path)))
+        const index = seen.get(real)
+        if (index === undefined) {
+          seen.set(real, collapsed.length)
+          collapsed.push(entry)
+          continue
+        }
+        const survivor = collapsed[index]
+        if (entry.origin === "project" && survivor.origin !== "project") {
+          collapsed[index] = { ...survivor, origin: "project" }
+        }
+      }
+
+      return collapsed
     })
 
     const system = Effect.fn("Instruction.system")(function* (reader: InstructionAudience.Reader) {

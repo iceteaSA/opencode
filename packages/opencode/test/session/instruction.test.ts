@@ -389,6 +389,60 @@ describe("Instruction.system", () => {
     }),
   )
 
+  it.live("renders AGENTS.md once when the project directory is the global config directory", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpWithFiles({ "AGENTS.md": "# Shared Instructions" })
+
+      yield* Effect.gen(function* () {
+        const svc = yield* Instruction.Service
+        const rules = yield* svc.system(mainBuild)
+        expect(rules).toHaveLength(1)
+        expect(rules[0]).toBe(`Instructions from: ${path.join(dir, "AGENTS.md")}\n# Shared Instructions`)
+      }).pipe(provideInstance(dir), provideInstruction({ home: dir, config: dir }))
+    }),
+  )
+
+  it.live("renders AGENTS.md once when the project directory is a symlink to the global config directory", () =>
+    Effect.gen(function* () {
+      const real = yield* tmpWithFiles({ "AGENTS.md": "# Shared Instructions" })
+      const wrapper = yield* tmpdirScoped()
+      const link = path.join(wrapper, "config")
+      const fs = yield* FileSystem.FileSystem
+      yield* fs.symlink(real, link)
+
+      yield* Effect.gen(function* () {
+        const svc = yield* Instruction.Service
+        const rules = yield* svc.system(mainBuild)
+        expect(rules).toHaveLength(1)
+        expect(rules[0]).toBe(`Instructions from: ${path.join(link, "AGENTS.md")}\n# Shared Instructions`)
+      }).pipe(provideInstance(link), provideInstruction({ home: link, config: link }))
+    }),
+  )
+
+  it.live("keeps distinct files with identical content", () =>
+    Effect.gen(function* () {
+      const globalTmp = yield* tmpdirScoped()
+      const projectTmp = yield* tmpWithFiles({
+        "AGENTS.md": "# Same Content",
+        "extra.md": "# Same Content",
+      })
+      const config = TestConfig.make({
+        get: () => Effect.succeed({ instructions: [path.join(projectTmp, "extra.md")] }),
+      })
+
+      yield* Effect.gen(function* () {
+        const svc = yield* Instruction.Service
+        const rules = yield* svc.system(mainBuild)
+        expect(rules).toHaveLength(2)
+        expect(rules[0]).toBe(`Instructions from: ${path.join(projectTmp, "AGENTS.md")}\n# Same Content`)
+        expect(rules[1]).toBe(`Instructions from: ${path.join(projectTmp, "extra.md")}\n# Same Content`)
+      }).pipe(
+        provideInstance(projectTmp),
+        Effect.provide(instructionLayer({ home: globalTmp, config: globalTmp }, {}, config)),
+      )
+    }),
+  )
+
   it.live("skips project and global CLAUDE.md when Claude Code prompt is disabled", () =>
     Effect.gen(function* () {
       const globalTmp = yield* tmpWithFiles({ ".claude/CLAUDE.md": "# Global Claude" })
@@ -442,6 +496,19 @@ describe("Instruction.systemScoped", () => {
         // "all" scope: both
         expect(all).toHaveLength(2)
       }).pipe(provideInstance(projectTmp), provideInstruction({ home: globalTmp, config: globalTmp }))
+    }),
+  )
+
+  it.live("systemScoped('project') keeps a file shared with the global config directory", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpWithFiles({ "AGENTS.md": "# Shared Instructions" })
+
+      yield* Effect.gen(function* () {
+        const svc = yield* Instruction.Service
+        const projectOnly = yield* svc.systemScoped("project", mainBuild)
+        expect(projectOnly).toHaveLength(1)
+        expect(projectOnly[0]).toBe(`Instructions from: ${path.join(dir, "AGENTS.md")}\n# Shared Instructions`)
+      }).pipe(provideInstance(dir), provideInstruction({ home: dir, config: dir }))
     }),
   )
 

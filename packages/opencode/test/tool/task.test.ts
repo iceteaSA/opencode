@@ -2233,6 +2233,183 @@ describe("tool.task", () => {
       }),
   )
 
+  it.instance(
+    "rejects slugs with path or format hazards",
+    () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const promptOps = stubOps()
+
+        const badSlugs = ["../escape", "a/b", "UPPER CASE", ".hidden", "-lead", "x".repeat(65)]
+
+        for (const slug of badSlugs) {
+          const exit = yield* def
+            .execute(
+              { description: "test", prompt: "test", subagent_type: "general", task_id: slug },
+              {
+                sessionID: chat.id,
+                messageID: assistant.id,
+                agent: "build",
+                abort: new AbortController().signal,
+                extra: { promptOps },
+                messages: [],
+                metadata: () => Effect.void,
+                ask: () => Effect.void,
+              },
+            )
+            .pipe(Effect.exit)
+          expect(Exit.isFailure(exit)).toBe(true)
+          if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("Invalid task_id slug")
+        }
+      }),
+  )
+
+  it.instance(
+    "rejects a slug already used by another parent in the same session tree",
+    () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const sessions = yield* Session.Service
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const promptOps = stubOps()
+
+        // First dispatch from root succeeds
+        yield* def.execute(
+          { description: "first", prompt: "do work", subagent_type: "general", task_id: "shared-slug" },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        // Create a sibling parent session (same tree: child of root)
+        const sibling = yield* sessions.create({ parentID: chat.id, title: "sibling parent", agent: "general" })
+        const siblingUser = yield* sessions.updateMessage({
+          id: MessageID.ascending(),
+          role: "user",
+          sessionID: sibling.id,
+          agent: "build",
+          model: ref,
+          time: { created: Date.now() },
+        })
+        const siblingAssistant: SessionV1.Assistant = {
+          id: MessageID.ascending(),
+          role: "assistant",
+          parentID: siblingUser.id,
+          sessionID: sibling.id,
+          mode: "build",
+          agent: "build",
+          cost: 0,
+          path: { cwd: "/tmp", root: "/tmp" },
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          modelID: ref.modelID,
+          providerID: ref.providerID,
+          variant: "xhigh",
+          time: { created: Date.now() },
+        }
+        yield* sessions.updateMessage(siblingAssistant)
+
+        // Dispatch from sibling with same slug — should fail (different parent, same tree)
+        const exit = yield* def
+          .execute(
+            { description: "second", prompt: "do work", subagent_type: "general", task_id: "shared-slug" },
+            {
+              sessionID: sibling.id,
+              messageID: siblingAssistant.id,
+              agent: "build",
+              abort: new AbortController().signal,
+              extra: { promptOps },
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.void,
+            },
+          )
+          .pipe(Effect.exit)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) {
+          expect(Cause.pretty(exit.cause)).toContain("already used by another session in this session tree")
+        }
+      }),
+    { config: { subagent_depth: 2 } },
+  )
+
+  it.instance(
+    "rejects resuming an idle task session without resume: true",
+    () =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const { chat, assistant } = yield* seed()
+        const child = yield* sessions.create({ parentID: chat.id, title: "done child", agent: "general" })
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const promptOps = stubOps()
+
+        const exit = yield* def
+          .execute(
+            { description: "test", prompt: "test", subagent_type: "general", task_id: child.id },
+            {
+              sessionID: chat.id,
+              messageID: assistant.id,
+              agent: "build",
+              abort: new AbortController().signal,
+              extra: { promptOps },
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.void,
+            },
+          )
+          .pipe(Effect.exit)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("resume: true")
+      }),
+  )
+
+  it.instance(
+    "rejects resume: true when the task_id does not exist",
+    () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const promptOps = stubOps()
+
+        const exit = yield* def
+          .execute(
+            {
+              description: "test",
+              prompt: "test",
+              subagent_type: "general",
+              task_id: "never-used-slug",
+              resume: true,
+            },
+            {
+              sessionID: chat.id,
+              messageID: assistant.id,
+              agent: "build",
+              abort: new AbortController().signal,
+              extra: { promptOps },
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.void,
+            },
+          )
+          .pipe(Effect.exit)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+      }),
+  )
+
   it.instance("completed task publishes enriched task.completed event", () =>
     Effect.gen(function* () {
       const events = yield* EventV2Bridge.Service
