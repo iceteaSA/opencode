@@ -1086,6 +1086,10 @@ const layer = Layer.effect(
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
+          if (!(yield* state.owns(sessionID))) {
+            yield* Effect.logWarning("session run lease lost", { "session.id": sessionID })
+            break
+          }
           yield* status.set(sessionID, { type: "busy" })
           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
