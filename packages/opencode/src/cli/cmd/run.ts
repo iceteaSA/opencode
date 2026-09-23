@@ -22,7 +22,7 @@ import { UI } from "../ui"
 import { effectCmd } from "../effect-cmd"
 import { EOL } from "os"
 import { Filesystem } from "@/util/filesystem"
-import { createOpencodeClient, type OpencodeClient, type ToolPart } from "@opencode-ai/sdk/v2"
+import { createOpencodeClient, type OpencodeClient, type Part, type ToolPart } from "@opencode-ai/sdk/v2"
 import { FormatError, FormatUnknownError } from "../error"
 import { INTERACTIVE_INPUT_ERROR, resolveInteractiveStdin } from "./run/runtime.stdin"
 import { createRunErrorDeduper } from "./run-error"
@@ -676,6 +676,7 @@ export const RunCommand = effectCmd({
         }
         const sessionID = sess.id
         const isDuplicateError = createRunErrorDeduper()
+        const printedTextParts = new Set<string>()
 
         function emit(type: string, data: Record<string, unknown>, source?: "session" | "request") {
           if (args.format === "json") {
@@ -691,6 +692,27 @@ export const RunCommand = effectCmd({
             return true
           }
           return false
+        }
+
+        function printUnseenTextParts(parts: Part[]) {
+          for (const part of parts) {
+            if (part.type !== "text" || printedTextParts.has(part.id)) continue
+            if (emit("text", { part })) {
+              printedTextParts.add(part.id)
+              continue
+            }
+            const text = part.text.trim()
+            if (!text) continue
+            if (!process.stdout.isTTY) {
+              process.stdout.write(text + EOL)
+              printedTextParts.add(part.id)
+              continue
+            }
+            UI.empty()
+            UI.println(text)
+            UI.empty()
+            printedTextParts.add(part.id)
+          }
         }
 
         // Consume one subscribed event stream for the active session and mirror it
@@ -754,16 +776,21 @@ export const RunCommand = effectCmd({
               }
 
               if (part.type === "text" && part.time?.end) {
-                if (emit("text", { part })) continue
+                if (emit("text", { part })) {
+                  printedTextParts.add(part.id)
+                  continue
+                }
                 const text = part.text.trim()
                 if (!text) continue
                 if (!process.stdout.isTTY) {
                   process.stdout.write(text + EOL)
+                  printedTextParts.add(part.id)
                   continue
                 }
                 UI.empty()
                 UI.println(text)
                 UI.empty()
+                printedTextParts.add(part.id)
               }
 
               if (part.type === "reasoning" && part.time?.end && thinking) {
@@ -860,6 +887,7 @@ export const RunCommand = effectCmd({
               return
             }
             await finish()
+            if (!args.attach) printUnseenTextParts(result.data.parts)
             return
           }
 
@@ -877,6 +905,7 @@ export const RunCommand = effectCmd({
             return
           }
           await finish()
+          if (!args.attach) printUnseenTextParts(result.data.parts)
           return
         }
 
