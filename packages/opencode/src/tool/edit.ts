@@ -16,7 +16,7 @@ import { Format } from "../format"
 import { InstanceState } from "@/effect/instance-state"
 import { permissionPath } from "@/project/instance-context"
 import { Snapshot } from "@/snapshot"
-import { assertExternalDirectoryEffect } from "./external-directory"
+import { assertExternalDirectoryEffect, resolveTarget } from "./external-directory"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import * as Bom from "@/util/bom"
 
@@ -81,7 +81,8 @@ export const EditTool = Tool.define(
           const filePath = path.isAbsolute(params.filePath)
             ? params.filePath
             : path.join(instance.directory, params.filePath)
-          yield* assertExternalDirectoryEffect(ctx, filePath)
+          const resolved = resolveTarget(filePath)
+          yield* assertExternalDirectoryEffect(ctx, resolved)
 
           let diff = ""
           let contentOld = ""
@@ -102,7 +103,7 @@ export const EditTool = Tool.define(
                 diff = trimDiff(createTwoFilesPatch(filePath, filePath, contentOld, contentNew))
                 yield* ctx.ask({
                   permission: "edit",
-                  patterns: [permissionPath(filePath, instance)],
+                  patterns: [permissionPath(resolved, instance)],
                   always: ["*"],
                   metadata: {
                     filepath: filePath,
@@ -145,7 +146,7 @@ export const EditTool = Tool.define(
               )
               yield* ctx.ask({
                 permission: "edit",
-                patterns: [permissionPath(filePath, instance)],
+                patterns: [permissionPath(resolved, instance)],
                 always: ["*"],
                 metadata: {
                   filepath: filePath,

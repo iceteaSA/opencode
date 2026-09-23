@@ -7,7 +7,7 @@ import { LSP } from "@/lsp/lsp"
 import DESCRIPTION from "./read.txt"
 import { InstanceState } from "@/effect/instance-state"
 import { permissionPath } from "@/project/instance-context"
-import { assertExternalDirectoryEffect } from "./external-directory"
+import { assertExternalDirectoryEffect, resolveTarget } from "./external-directory"
 import { Instruction } from "../session/instruction"
 import { isPdfAttachment, sniffAttachmentMime } from "@/util/media"
 
@@ -248,14 +248,15 @@ export const ReadTool = Tool.define<
         ),
       )
 
-      yield* assertExternalDirectoryEffect(ctx, filepath, {
+      const resolved = resolveTarget(filepath)
+      yield* assertExternalDirectoryEffect(ctx, resolved, {
         bypass: Boolean(ctx.extra?.["bypassCwdCheck"]),
         kind: stat?.type === "Directory" ? "directory" : "file",
       })
 
       yield* ctx.ask({
         permission: "read",
-        patterns: [permissionPath(filepath, instance)],
+        patterns: [permissionPath(resolved, instance)],
         always: ["*"],
         metadata: {},
       })

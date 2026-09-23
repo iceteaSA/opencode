@@ -16,7 +16,11 @@ type Kind = "file" | "directory"
 // Windows already resolved here via `normalizePath` (which calls `realpathSync.native`).
 // Do the same on POSIX so both platforms check, and display, the path the filesystem
 // will actually touch.
-function resolveTarget(target: string) {
+// Exported so read/write/edit/apply_patch can apply the same resolution to
+// their read/edit permission patterns — without it, an in-project link
+// targeting outside the project would still surface the in-project alias to
+// the rule check, so an absolute `/outside/**` deny would miss.
+export function resolveTarget(target: string) {
   return follow(process.platform === "win32" ? FSUtil.normalizePath(target) : path.resolve(target))
 }
 

@@ -3,6 +3,8 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Effect, Layer } from "effect"
 import path from "path"
 import fs from "fs/promises"
+import { symlink } from "fs/promises"
+import { realpathSync } from "fs"
 import { WriteTool } from "../../src/tool/write"
 import { LSP } from "@/lsp/lsp"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -15,7 +17,7 @@ import { SessionID, MessageID } from "../../src/session/schema"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Permission } from "../../src/permission"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
-import { disposeAllInstances, TestInstance } from "../fixture/fixture"
+import { disposeAllInstances, TestInstance, tmpdirScoped } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 
 const ctx = {
@@ -71,6 +73,20 @@ const askWithRules = (ruleset: PermissionV1.Ruleset) => ({
       }
     }),
 })
+
+const asks = () => {
+  const items: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+  return {
+    items,
+    ctx: {
+      ...ctx,
+      ask: (input: Parameters<Tool.Context["ask"]>[0]) =>
+        Effect.sync(() => {
+          items.push(input)
+        }),
+    },
+  }
+}
 
 describe("tool.write permission paths", () => {
   it.instance("matches an inside-worktree relative rule", () =>
@@ -128,6 +144,100 @@ describe("tool.write permission paths", () => {
     }),
     { git: true },
   )
+
+  if (process.platform !== "win32") {
+    it.instance(
+      "regression: no symlink keeps the worktree-relative pattern",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const filepath = path.join(test.directory, "src", "inside.txt")
+          const { items, ctx } = asks()
+          yield* run({ filePath: filepath, content: "x" }, ctx)
+          const edit = items.find((item) => item.permission === "edit")
+          expect(edit).toBeDefined()
+          expect(edit!.patterns).toEqual([path.join("src", "inside.txt")])
+        }),
+      { git: true },
+    )
+
+    it.instance(
+      "in-project link → outside file uses the absolute real path so deny rules match",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const outside = yield* tmpdirScoped()
+          const link = path.join(test.directory, "vendor")
+          yield* Effect.promise(() => symlink(outside, link))
+          const target = path.join(link, "existing.txt")
+          yield* Effect.promise(() => Bun.write(target, "x"))
+
+          const { items, ctx } = asks()
+          yield* run({ filePath: target, content: "x" }, ctx)
+          const edit = items.find((item) => item.permission === "edit")
+          expect(edit).toBeDefined()
+          expect(edit!.patterns).toEqual([path.join(realpathSync(outside), "existing.txt")])
+        }),
+      { git: true },
+    )
+
+    it.instance(
+      "outside link → inside file uses the worktree-relative real path",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const outer = yield* tmpdirScoped()
+          const link = path.join(outer, "alias")
+          yield* Effect.promise(() => symlink(test.directory, link))
+          const target = path.join(link, "inside.txt")
+          yield* Effect.promise(() => Bun.write(target, "x"))
+
+          const { items, ctx } = asks()
+          yield* run({ filePath: target, content: "x" }, ctx)
+          const edit = items.find((item) => item.permission === "edit")
+          expect(edit).toBeDefined()
+          expect(edit!.patterns).toEqual(["inside.txt"])
+        }),
+      { git: true },
+    )
+
+    it.instance(
+      "non-existent target under a symlinked directory resolves through the directory",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const outside = yield* tmpdirScoped()
+          const link = path.join(test.directory, "vendor")
+          yield* Effect.promise(() => symlink(outside, link))
+          const target = path.join(link, "brand-new.txt")
+
+          const { items, ctx } = asks()
+          yield* run({ filePath: target, content: "x" }, ctx)
+          const edit = items.find((item) => item.permission === "edit")
+          expect(edit).toBeDefined()
+          expect(edit!.patterns).toEqual([path.join(realpathSync(outside), "brand-new.txt")])
+        }),
+      { git: true },
+    )
+
+    it.instance(
+      "in-project link → outside file is denied by an absolute `/outside/**` rule",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const outside = yield* tmpdirScoped()
+          const link = path.join(test.directory, "vendor")
+          yield* Effect.promise(() => symlink(outside, link))
+          const target = path.join(link, "denied.txt")
+
+          const rules = Permission.fromConfig({ edit: { "*": "allow", [`${realpathSync(outside)}/**`]: "deny" } })
+          const exit = yield* run({ filePath: target, content: "denied" }, askWithRules(rules)).pipe(Effect.exit)
+          expect(exit._tag).toBe("Failure")
+          expect(yield* Effect.promise(() => fs.stat(target).catch(() => undefined))).toBeUndefined()
+        }),
+      { git: true },
+    )
+  }
 })
 
 describe("tool.write", () => {

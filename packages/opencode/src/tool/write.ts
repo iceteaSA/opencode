@@ -13,7 +13,7 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { InstanceState } from "@/effect/instance-state"
 import { permissionPath } from "@/project/instance-context"
 import { trimDiff } from "./edit"
-import { assertExternalDirectoryEffect } from "./external-directory"
+import { assertExternalDirectoryEffect, resolveTarget } from "./external-directory"
 import * as Bom from "@/util/bom"
 
 const MAX_PROJECT_DIAGNOSTICS_FILES = 5
@@ -42,7 +42,8 @@ export const WriteTool = Tool.define(
           const filepath = path.isAbsolute(params.filePath)
             ? params.filePath
             : path.join(instance.directory, params.filePath)
-          yield* assertExternalDirectoryEffect(ctx, filepath)
+          const resolved = resolveTarget(filepath)
+          yield* assertExternalDirectoryEffect(ctx, resolved)
 
           const exists = yield* fs.existsSafe(filepath)
           const source = exists ? yield* Bom.readFile(fs, filepath) : { bom: false, text: "" }
@@ -54,7 +55,7 @@ export const WriteTool = Tool.define(
           const diff = trimDiff(createTwoFilesPatch(filepath, filepath, contentOld, contentNew))
           yield* ctx.ask({
             permission: "edit",
-            patterns: [permissionPath(filepath, instance)],
+            patterns: [permissionPath(resolved, instance)],
             always: ["*"],
             metadata: {
               filepath,

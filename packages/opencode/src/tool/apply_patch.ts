@@ -7,7 +7,7 @@ import { InstanceState } from "@/effect/instance-state"
 import { permissionPath } from "@/project/instance-context"
 import { Patch } from "../patch"
 import { createTwoFilesPatch, diffLines } from "diff"
-import { assertExternalDirectoryEffect } from "./external-directory"
+import { assertExternalDirectoryEffect, resolveTarget } from "./external-directory"
 import { trimDiff } from "./edit"
 import { LSP } from "@/lsp/lsp"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -203,7 +203,9 @@ export const ApplyPatchTool = Tool.define(
       }))
 
       // Check permissions if needed
-      const relativePaths = fileChanges.map((c) => permissionPath(c.filePath, instance).replaceAll("\\", "/"))
+      const relativePaths = fileChanges.map((c) =>
+        permissionPath(resolveTarget(c.filePath), instance).replaceAll("\\", "/"),
+      )
       yield* ctx.ask({
         permission: "edit",
         patterns: relativePaths,
