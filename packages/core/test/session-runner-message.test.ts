@@ -140,25 +140,24 @@ Recent work
     ])
   })
 
-  test("appends the current date to the trailing user message for DeepSeek", () => {
-    const messages = toLLMMessages(
-      [
-        SessionMessage.User.make({
-          id: id("deepseek-user"),
-          type: "user",
-          text: "What changed?",
-          time: { created },
-        }),
-      ],
-      deepSeekModel,
-    )
+  test("does not append a date to the trailing user message", () => {
+    for (const selected of [model, deepSeekModel]) {
+      const messages = toLLMMessages(
+        [
+          SessionMessage.User.make({
+            id: id("user"),
+            type: "user",
+            text: "What changed?",
+            time: { created },
+          }),
+        ],
+        selected,
+      )
 
-    expect(messages).toHaveLength(1)
-    expect(messages[0]?.role).toBe("user")
-    expect(messages[0]?.content).toEqual([
-      { type: "text", text: "What changed?" },
-      { type: "text", text: `Today's date: ${new Date().toDateString()}` },
-    ])
+      expect(messages).toHaveLength(1)
+      expect(messages[0]?.role).toBe("user")
+      expect(messages[0]?.content).toEqual([{ type: "text", text: "What changed?" }])
+    }
   })
 
   test("replays durable tool media into canonical tool messages without structured base64", () => {

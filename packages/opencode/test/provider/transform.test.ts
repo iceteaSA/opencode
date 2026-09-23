@@ -632,7 +632,7 @@ describe("ProviderTransform.options - gpt-5 textVerbosity", () => {
     expect(result.tools.lookup.strict).toBe(false)
   })
 
-  test("DeepSeek appends the current date to the trailing user message instead of system", async () => {
+  test("request prep does not append a date for DeepSeek or other models", async () => {
     const model = {
       id: "deepseek/deepseek-chat",
       providerID: "deepseek",
@@ -666,52 +666,67 @@ describe("ProviderTransform.options - gpt-5 textVerbosity", () => {
       options: {},
       headers: {},
     } as any
-    const result = await Effect.runPromise(
-      LLMRequestPrep.prepare({
-        user: {
-          id: "msg_user-test",
+    const cases = [
+      { model, providerID: "deepseek" },
+      {
+        model: {
+          ...model,
+          id: "openai/gpt-5",
+          providerID: "openai",
+          api: { ...model.api, id: "gpt-5", url: "https://api.openai.com" },
+          name: "GPT-5",
+        },
+        providerID: "openai",
+      },
+    ]
+    for (const item of cases) {
+      const result = await Effect.runPromise(
+        LLMRequestPrep.prepare({
+          user: {
+            id: "msg_user-test",
+            sessionID,
+            role: "user",
+            time: { created: Date.now() },
+            agent: "test",
+            model: { providerID: item.providerID, modelID: item.model.api.id },
+          } as any,
           sessionID,
-          role: "user",
-          time: { created: Date.now() },
-          agent: "test",
-          model: { providerID: "deepseek", modelID: "deepseek-chat" },
-        } as any,
-        sessionID,
-        model,
-        agent: {
-          name: "test",
-          mode: "primary",
-          options: {},
-          permission: [],
-        } as any,
-        system: [],
-        messages: [{ role: "user", content: "Hello" }],
-        tools: {},
-        provider: { id: "deepseek", options: {} } as any,
-        auth: undefined,
-        plugin: {
-          trigger: (_name: string, _input: unknown, output: unknown) => Effect.succeed(output),
-          list: () => Effect.succeed([]),
-          init: () => Effect.void,
-        } as any,
-        flags: { outputTokenMax: 32_000, client: "test" } as any,
-        isWorkflow: false,
-      }),
-    )
+          model: item.model,
+          agent: {
+            name: "test",
+            mode: "primary",
+            options: {},
+            permission: [],
+          } as any,
+          system: ["You are a coding agent."],
+          messages: [{ role: "user", content: "Hello" }],
+          tools: {},
+          provider: { id: item.providerID, options: {} } as any,
+          auth: undefined,
+          plugin: {
+            trigger: (_name: string, _input: unknown, output: unknown) => Effect.succeed(output),
+            list: () => Effect.succeed([]),
+            init: () => Effect.void,
+          } as any,
+          flags: { outputTokenMax: 32_000, client: "test" } as any,
+          isWorkflow: false,
+        }),
+      )
 
-    expect(result.messages.at(-1)).toEqual({
-      role: "user",
-      content: [
-        { type: "text", text: "Hello" },
-        { type: "text", text: `Today's date: ${new Date().toDateString()}` },
-      ],
-    })
-    expect(
-      result.messages.some(
-        (message) =>
-          message.role === "system" && typeof message.content === "string" && message.content.includes("Today's date:"),
-      ),
-    ).toBe(false)
+      expect(result.messages.at(-1)).toEqual({ role: "user", content: "Hello" })
+      expect(
+        result.messages.some((message) => message.role === "system" && message.content === "You are a coding agent."),
+      ).toBe(true)
+      expect(
+        result.messages.some(
+          (message) =>
+            (message.role === "system" &&
+              typeof message.content === "string" &&
+              message.content.includes("Today's date")) ||
+            (message.role === "user" && JSON.stringify(message.content).includes("Today's date")),
+        ),
+      ).toBe(false)
+    }
   })
 
   test("gpt-5.1 should have textVerbosity set to low", () => {
@@ -2376,11 +2391,7 @@ describe("ProviderTransform.message - DeepSeek reasoning content", () => {
       },
     ] as any[]
 
-    const result = ProviderTransform.message(
-      msgs,
-      deepSeekModel(),
-      {},
-    )
+    const result = ProviderTransform.message(msgs, deepSeekModel(), {})
 
     expect(result).toHaveLength(2)
     expect(result[1].content).toEqual([
