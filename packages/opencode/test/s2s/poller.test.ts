@@ -30,6 +30,7 @@
 // on top so the poller has a real in-memory SQLite (Database.layerFromPath)
 // to read/write against.
 
+import { EffectFlock } from '@opencode-ai/core/util/effect-flock';
 import { afterEach, describe, expect } from "bun:test"
 import { Duration, Effect, Layer, Option } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -152,7 +153,7 @@ const lspStub = Layer.succeed(
 )
 
 const statusNode = LayerNode.make({ service: SessionStatus.Service, layer: SessionStatus.layer, deps: [EventV2Bridge.node] })
-const runStateNode = LayerNode.make({ service: SessionRunState.Service, layer: SessionRunState.layer, deps: [BackgroundJob.node, statusNode] })
+const runStateNode = LayerNode.make({ service: SessionRunState.Service, layer: SessionRunState.layer, deps: [BackgroundJob.node, statusNode, EffectFlock.node] })
 
 const providerRef = {
   providerID: ProviderV2.ID.make("test"),

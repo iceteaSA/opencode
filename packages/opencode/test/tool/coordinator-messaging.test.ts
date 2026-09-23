@@ -1,3 +1,4 @@
+import { EffectFlock } from '@opencode-ai/core/util/effect-flock';
 import { afterEach, describe, expect } from "bun:test"
 import { Cause, Effect, Exit, Layer } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -255,7 +256,7 @@ const lspStub = Layer.succeed(
 )
 
 const statusNode = LayerNode.make({ service: SessionStatus.Service, layer: SessionStatus.layer, deps: [EventV2Bridge.node] })
-const runStateNode = LayerNode.make({ service: SessionRunState.Service, layer: SessionRunState.layer, deps: [BackgroundJob.node, statusNode] })
+const runStateNode = LayerNode.make({ service: SessionRunState.Service, layer: SessionRunState.layer, deps: [BackgroundJob.node, statusNode, EffectFlock.node] })
 
 const providerRef = {
   providerID: ProviderV2.ID.make("test"),

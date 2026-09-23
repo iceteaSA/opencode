@@ -22,6 +22,7 @@
 // Dropping either fix reproduces the RED failure below (see the fix's
 // commit message / return summary for the before/after run transcripts).
 
+import { EffectFlock } from '@opencode-ai/core/util/effect-flock';
 import { afterEach, describe, expect } from "bun:test"
 import { Effect, Layer } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -134,7 +135,7 @@ const lspStub = Layer.succeed(
 )
 
 const statusNode = LayerNode.make({ service: SessionStatus.Service, layer: SessionStatus.layer, deps: [EventV2Bridge.node] })
-const runStateNode = LayerNode.make({ service: SessionRunState.Service, layer: SessionRunState.layer, deps: [BackgroundJob.node, statusNode] })
+const runStateNode = LayerNode.make({ service: SessionRunState.Service, layer: SessionRunState.layer, deps: [BackgroundJob.node, statusNode, EffectFlock.node] })
 
 // experimentalS2S stays OFF here — wake-on-message (task.ts's wake_on_message
 // param → Messaging.setWakePolicy) is independent of the s2s cross-process

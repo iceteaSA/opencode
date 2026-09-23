@@ -23,6 +23,7 @@
 // wakeBody() the C′ fork calls is a no-op stub until that registration runs.
 import "@/s2s/poller"
 
+import { EffectFlock } from '@opencode-ai/core/util/effect-flock';
 import { afterAll, afterEach, beforeAll, describe, expect } from "bun:test"
 import { Effect, Layer } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -153,7 +154,7 @@ const lspStub = Layer.succeed(
 )
 
 const statusNode = LayerNode.make({ service: SessionStatus.Service, layer: SessionStatus.layer, deps: [EventV2Bridge.node] })
-const runStateNode = LayerNode.make({ service: SessionRunState.Service, layer: SessionRunState.layer, deps: [BackgroundJob.node, statusNode] })
+const runStateNode = LayerNode.make({ service: SessionRunState.Service, layer: SessionRunState.layer, deps: [BackgroundJob.node, statusNode, EffectFlock.node] })
 
 // experimentalS2S: true is the load-bearing difference from wakeup-spike — it
 // gates the C′ fork in SessionPrompt.loop.
