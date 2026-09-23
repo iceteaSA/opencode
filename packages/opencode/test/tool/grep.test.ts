@@ -189,6 +189,7 @@ describe("tool.grep", () => {
         grep: "allow",
         external_directory: {
           [path.join(alias, "*")]: "allow",
+          [path.join(real, "*")]: "allow",
         },
       })
       const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
