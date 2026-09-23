@@ -13,7 +13,6 @@ import { EventV2Bridge } from "../../src/event-v2-bridge"
 import { Truncate } from "@/tool/truncate"
 import { TestInstance } from "../fixture/fixture"
 import { SessionID, MessageID } from "../../src/session/schema"
-import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Permission } from "../../src/permission"
 import { testEffect } from "../lib/effect"
 
@@ -112,15 +111,15 @@ describe("tool.apply_patch permission paths", () => {
     () =>
       Effect.gen(function* () {
         const test = yield* TestInstance
-        const outer = yield* Effect.promise(() => fs.mkdtemp(path.join(path.dirname(test.directory), "opencode-outside-")))
+        const outer = yield* Effect.promise(() =>
+          fs.mkdtemp(path.join(path.dirname(test.directory), "opencode-outside-")),
+        )
         const first = path.join(outer, "first.txt")
         const second = path.join(outer, "second.txt")
         const firstRelative = path.relative(test.directory, first).replaceAll("\\", "/")
         const secondRelative = path.relative(test.directory, second).replaceAll("\\", "/")
         const patchText = `*** Begin Patch\n*** Add File: ${firstRelative}\n+first\n*** Add File: ${secondRelative}\n+second\n*** End Patch`
-        const { ctx, calls } = makeRulesCtx(
-          Permission.fromConfig({ edit: { "*": "allow", [`${outer}/**`]: "deny" } }),
-        )
+        const { ctx, calls } = makeRulesCtx(Permission.fromConfig({ edit: { "*": "allow", [`${outer}/**`]: "deny" } }))
 
         const exit = yield* execute({ patchText }, ctx).pipe(Effect.exit)
         expect(exit._tag).toBe("Failure")
