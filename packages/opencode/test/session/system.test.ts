@@ -199,14 +199,17 @@ describe("session.system", () => {
   )
 
   it.instance(
-    "omits the dynamic date line for DeepSeek environments",
+    "omits the dynamic date line for every model",
     Effect.gen(function* () {
       const prompt = yield* SystemPrompt.Service
-      const output = yield* prompt.environment(model("deepseek-chat", "deepseek"))
+      const deepseek = (yield* prompt.environment(model("deepseek-chat", "deepseek"))).join("\n")
+      const other = (yield* prompt.environment(model("gpt-5", "openai"))).join("\n")
 
-      expect(output.join("\n")).not.toContain("Today's date:")
-      expect(output.join("\n")).toContain("Working directory:")
-      expect(output.join("\n")).toContain(`Platform: ${process.platform}`)
+      for (const output of [deepseek, other]) {
+        expect(output).not.toContain("Today's date")
+        expect(output).toContain("Working directory:")
+        expect(output).toContain(`  Platform: ${process.platform}\n</env>`)
+      }
     }),
   )
 })

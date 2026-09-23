@@ -3,6 +3,7 @@ import { drizzle } from "drizzle-orm/node-sqlite"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
+import { Duration } from "effect"
 import { identity } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Scope from "effect/Scope"
@@ -13,7 +14,7 @@ import * as Client from "effect/unstable/sql/SqlClient"
 import type { Connection } from "effect/unstable/sql/SqlConnection"
 import { classifySqliteError, SqlError } from "effect/unstable/sql/SqlError"
 import * as Statement from "effect/unstable/sql/Statement"
-import { Sqlite } from "./sqlite"
+import { Sqlite, retryLocked } from "./sqlite"
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name"
 
@@ -53,6 +54,7 @@ const make = (options: Config) =>
       ? Statement.defaultTransforms(options.transformResultNames).array
       : undefined
 
+    const retryIfAutocommit = retryLocked(() => native.isTransaction)
     const run = (query: string, params: ReadonlyArray<unknown> = []) =>
       Effect.withFiber<Array<Record<string, unknown>>, SqlError>((fiber) => {
         const statement = native.prepare(query)
@@ -66,7 +68,7 @@ const make = (options: Config) =>
             }),
           )
         }
-      })
+      }).pipe(retryIfAutocommit)
 
     const runValues = (query: string, params: ReadonlyArray<unknown> = []) =>
       Effect.withFiber<ReadonlyArray<ReadonlyArray<unknown>>, SqlError>((fiber) => {
@@ -84,7 +86,7 @@ const make = (options: Config) =>
             }),
           )
         }
-      })
+      }).pipe(retryIfAutocommit)
 
     const connection = identity<SqliteConnection>({
       execute(query, params, transformRows) {
@@ -150,13 +152,27 @@ const nativeLayer = (config: Config) =>
     Effect.gen(function* () {
       const native = new DatabaseSync(config.filename, {
         readOnly: config.readonly,
-        timeout: config.timeout,
+        timeout: config.timeout ?? 5_000,
         allowExtension: config.allowExtension,
         enableForeignKeyConstraints: true,
         open: true,
       })
       yield* Effect.addFinalizer(() => Effect.sync(() => native.close()))
-      if (config.disableWAL !== true && config.readonly !== true) native.exec("PRAGMA journal_mode = WAL;")
+      if (config.disableWAL !== true && config.readonly !== true) {
+        // journal-mode changes bypass the busy handler, so retry ourselves
+        const deadline = Date.now() + (config.timeout ?? 5_000)
+        for (;;) {
+          try {
+            native.exec("PRAGMA journal_mode = WAL;")
+            break
+          } catch (error) {
+            const remaining = deadline - Date.now()
+            // primary result code 5 = SQLITE_BUSY; anything else is not retryable
+            if ((((error as { errcode?: number }).errcode ?? -1) & 0xff) !== 5 || remaining <= 0) throw error
+            yield* Effect.sleep(Duration.millis(Math.min(25, remaining)))
+          }
+        }
+      }
       return native
     }),
   )
