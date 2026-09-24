@@ -53,7 +53,9 @@ import { Session } from "@/session/session"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Truncate } from "@/tool/truncate"
 import { S2STool } from "../../src/tool/s2s"
-import { MessageID, SessionID } from "../../src/session/schema"
+import { MessageID, PartID, SessionID } from "../../src/session/schema"
+import { ModelV2 } from "@opencode-ai/core/model"
+import { ProviderV2 } from "@opencode-ai/core/provider"
 import { testEffectShared } from "../lib/effect"
 
 const database = Database.layerFromPath(":memory:")
@@ -346,36 +348,85 @@ describe("S2STool", () => {
     }),
   )
 
-  it.instance(
-    "msg to an allow-listed peer that is NOT in-process writes a s2s_inbox row via enqueueExternal",
-    () =>
-      Effect.gen(function* () {
-        const store = yield* S2SStore.Service
-        // Two real sessions; the target is addressed by session_id and
-        // is NOT in the local set (so isLocal is false and we take the
-        // cross-process path). Consent is the durable s2s_allow row.
-        const inviter = yield* seedSession("inviter-5")
-        const target = yield* seedSession("remote-5")
-        // Manually write the allow (skip the invite/accept dance
-        // because that's covered above — this test is about msg's
-        // cross-process dispatch, not the handshake).
-        yield* store.insertAllow(inviter.id, target.id)
-        // Target is NOT in this process's local set (no registerLocal
-        // call) → enqueueExternal is taken.
-        const tool = yield* S2STool
-        const def = yield* tool.init()
-        const result = yield* def.execute(
-          { command: "msg", target: target.id, body: "ping" },
-          ctxFor(inviter.id),
-        )
-        expect(result.output).toContain("Persisted to s2s_inbox")
-        // The row is there.
-        const rows = yield* store.claimForSessions([target.id])
-        expect(rows).toHaveLength(1)
-        const decoded = decodeCapsule(rows[0]!.capsule)
-        expect(decoded.body).toBe("ping")
-        expect(decoded.sender_slug).toBe(inviter.autoSlug)
-      }),
+  it.instance("msg to an allow-listed peer that is NOT in-process writes a s2s_inbox row via enqueueExternal", () =>
+    Effect.gen(function* () {
+      const store = yield* S2SStore.Service
+      // Two real sessions; the target is addressed by session_id and
+      // is NOT in the local set (so isLocal is false and we take the
+      // cross-process path). Consent is the durable s2s_allow row.
+      const inviter = yield* seedSession("inviter-5")
+      const target = yield* seedSession("remote-5")
+      // Manually write the allow (skip the invite/accept dance
+      // because that's covered above — this test is about msg's
+      // cross-process dispatch, not the handshake).
+      yield* store.insertAllow(inviter.id, target.id)
+      // Target is NOT in this process's local set (no registerLocal
+      // call) → enqueueExternal is taken.
+      const tool = yield* S2STool
+      const def = yield* tool.init()
+      const result = yield* def.execute({ command: "msg", target: target.id, body: "ping" }, ctxFor(inviter.id))
+      expect(result.output).toContain("Persisted to s2s_inbox")
+      // The row is there.
+      const rows = yield* store.claimForSessions([target.id])
+      expect(rows).toHaveLength(1)
+      const decoded = decodeCapsule(rows[0]!.capsule)
+      expect(decoded.body).toBe("ping")
+      expect(decoded.sender_slug).toBe(inviter.autoSlug)
+    }),
+  )
+
+  it.instance("msg persists mail when a newer human turn moved a local peer to another process", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const messaging = yield* Messaging.Service
+      const store = yield* S2SStore.Service
+      const sender = yield* seedSession("sender-moved")
+      const target = yield* seedSession("target-moved")
+      const model = { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test") }
+      const first = MessageID.ascending()
+      yield* sessions.updateMessage({
+        id: first,
+        sessionID: target.id,
+        role: "user",
+        agent: "build",
+        model,
+        time: { created: Date.now() },
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: first,
+        sessionID: target.id,
+        type: "text",
+        text: "first",
+      })
+      yield* messaging.registerLocal(target.id, first)
+      const second = MessageID.ascending()
+      yield* sessions.updateMessage({
+        id: second,
+        sessionID: target.id,
+        role: "user",
+        agent: "build",
+        model,
+        time: { created: Date.now() + 1 },
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: second,
+        sessionID: target.id,
+        type: "text",
+        text: "second",
+      })
+      yield* store.insertAllow(sender.id, target.id)
+      const tool = yield* S2STool
+      const def = yield* tool.init()
+
+      const result = yield* def.execute({ command: "msg", target: target.id, body: "moving" }, ctxFor(sender.id))
+
+      expect(result.output).toContain("Persisted to s2s_inbox")
+      expect(yield* store.countUndelivered(target.id)).toBe(1)
+      expect(yield* messaging.drain(target.id)).toEqual([])
+      expect(yield* messaging.localSet()).not.toContain(target.id)
+    }),
   )
 
   it.instance("leave deletes both s2s_allow directions", () =>
@@ -418,10 +469,7 @@ describe("S2STool", () => {
       const inviter = yield* seedSession("inviter-7")
       const tool = yield* S2STool
       const def = yield* tool.init()
-      const result = yield* def.execute(
-        { command: "relay", body: "relay-payload" },
-        ctxFor(inviter.id),
-      )
+      const result = yield* def.execute({ command: "relay", body: "relay-payload" }, ctxFor(inviter.id))
       // Output is a JSON-encoded v1 capsule; decoding it round-trips
       // the body and the sender slug.
       const parsed: unknown = JSON.parse(result.output)

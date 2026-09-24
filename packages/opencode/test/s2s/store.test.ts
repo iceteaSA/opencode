@@ -33,6 +33,24 @@ const INVITER = SessionID.make("ses_inviter_one")
 const JOINER = SessionID.make("ses_joiner_one")
 
 describe("S2SStore", () => {
+  it.effect("pendingTargets returns distinct unclaimed local targets only", () =>
+    Effect.gen(function* () {
+      const store = yield* S2SStore.Service
+      yield* Effect.forEach(
+        [
+          { id: "inb_pending_first", targetSessionID: S1 },
+          { id: "inb_pending_second", targetSessionID: S1 },
+          { id: "inb_claimed", targetSessionID: S2 },
+          { id: "inb_other", targetSessionID: S3 },
+        ],
+        (row) => store.insertInbox({ ...row, fromSessionID: INVITER, fromSlug: "peer", capsule: "x", timeCreated: 1 }),
+      )
+      yield* store.claimForSessions([S2])
+
+      expect(yield* store.pendingTargets([S1, S2])).toEqual([S1])
+      expect(yield* store.pendingTargets([])).toEqual([])
+    }),
+  )
   it.effect("claimForSessions drains and de-duplicates a row", () =>
     Effect.gen(function* () {
       const store = yield* S2SStore.Service

@@ -51,6 +51,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 
 import { registerWakeBody } from "@/s2s/wake-registry"
+import { isLocalForLatestUser } from "@/s2s/local-owner"
 
 const REAPER_WINDOW_MS_DEFAULT = 60_000
 const MIN_REAPER_MS = 1
@@ -166,7 +167,12 @@ export const pollOnceImpl = Effect.fn("S2SPoller.pollOnce")(function* () {
   const locals = yield* messaging.localSet()
   if (locals.length === 0) return
 
-  const rows = yield* store.claimForSessions(locals)
+  const pending = yield* store.pendingTargets(locals)
+  if (pending.length === 0) return
+  const sessions = yield* Session.Service
+  const owned = yield* Effect.filter(pending, (sessionID) => isLocalForLatestUser(sessionID, messaging, sessions))
+  if (owned.length === 0) return
+  const rows = yield* store.claimForSessions(owned)
   for (const row of rows) {
     // processRow is per-row; an exception in one row's wake must not
     // prevent subsequent rows from being processed. Failures are caught
@@ -199,9 +205,7 @@ export const wakePollerLoop = (pollMs: number): Effect.Effect<void> =>
     // A single tick failure must NOT silently terminate Effect.schedule (which
     // would permanently disable cross-process delivery for this instance). Log
     // at warning level and let the schedule continue to the next tick.
-    Effect.catchCause((cause) =>
-      Effect.logWarning("s2s wake-poller tick failed", { cause: Cause.pretty(cause) }),
-    ),
+    Effect.catchCause((cause) => Effect.logWarning("s2s wake-poller tick failed", { cause: Cause.pretty(cause) })),
     Effect.schedule(Schedule.spaced(Duration.millis(pollMs))),
   ) as unknown as Effect.Effect<void>
 
@@ -224,11 +228,13 @@ const reapOnceImpl = Effect.fn("S2SPoller.reapOnce")(function* (now: number, win
   // Garbage-collect rows that reference sessions that no longer exist.
   // Best-effort: a GC failure is logged but must not break the reaper
   // tick (the same pattern as the pollOnce error handler).
-  yield* store.deleteOrphaned().pipe(
-    Effect.catchCause((cause) =>
-      Effect.logWarning("S2SPoller: deleteOrphaned failed", { cause: Cause.pretty(cause) }),
-    ),
-  )
+  yield* store
+    .deleteOrphaned()
+    .pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("S2SPoller: deleteOrphaned failed", { cause: Cause.pretty(cause) }),
+      ),
+    )
 })
 
 const parseMs = (raw: string | undefined, fallback: number, min: number): number => {
@@ -250,8 +256,7 @@ export const layer = Layer.effect(
     // requirement types. Wrap with a thin lambda so the Interface's
     // `Effect<void, never, never>` contract is preserved.
     const pollOnce: Interface["pollOnce"] = () => pollOnceImpl() as unknown as Effect.Effect<void>
-    const reapOnce: Interface["reapOnce"] = (now) =>
-      reapOnceImpl(now) as unknown as Effect.Effect<void>
+    const reapOnce: Interface["reapOnce"] = (now) => reapOnceImpl(now) as unknown as Effect.Effect<void>
 
     // Background loops — gated on the experimentalS2S flag so the
     // service is dead code in environments where S2S is off (the test
@@ -265,11 +270,7 @@ export const layer = Layer.effect(
     // loop + Created subscriber were removed — session registration
     // (registerLocal + registerSlug) now happens in SessionPrompt.loop.
     if (flags.experimentalS2S) {
-      const reapWindowMs = parseMs(
-        process.env["OPENCODE_S2S_REAP_WINDOW_MS"],
-        REAPER_WINDOW_MS_DEFAULT,
-        MIN_REAPER_MS,
-      )
+      const reapWindowMs = parseMs(process.env["OPENCODE_S2S_REAP_WINDOW_MS"], REAPER_WINDOW_MS_DEFAULT, MIN_REAPER_MS)
       // Reap interval matches the window by default so each tick resets any
       // claim older than one window. Overriding the window also shrinks the
       // interval, which lets tests drive the loop quickly without real sleeps.

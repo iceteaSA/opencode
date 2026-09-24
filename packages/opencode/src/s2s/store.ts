@@ -164,6 +164,7 @@ export interface Interface {
     inboxCap: number
   }) => Effect.Effect<EnqueueResult, S2SStoreError>
   readonly claimForSessions: (ids: ReadonlyArray<SessionID>) => Effect.Effect<InboxRow[], S2SStoreError>
+  readonly pendingTargets: (ids: ReadonlyArray<SessionID>) => Effect.Effect<SessionID[], S2SStoreError>
   readonly deleteInbox: (id: string) => Effect.Effect<void, S2SStoreError>
   readonly reapStale: (olderThan: number) => Effect.Effect<void, S2SStoreError>
   readonly countUndelivered: (target: SessionID) => Effect.Effect<number, S2SStoreError>
@@ -331,6 +332,21 @@ export const layer = Layer.effect(
       return claimed.map(toInboxRow)
     })
 
+    const pendingTargets: Interface["pendingTargets"] = Effect.fn("S2SStore.pendingTargets")(function* (ids) {
+      if (ids.length === 0) return []
+      const rows = yield* query(
+        db.all<{ target: string }>(sql`
+          SELECT DISTINCT target_session_id AS target FROM s2s_inbox
+          WHERE target_session_id IN (${sql.join(
+            ids.map((id) => sql`${id}`),
+            sql`, `,
+          )})
+            AND drained_at IS NULL
+        `),
+      )
+      return rows.map((row) => SessionID.make(row.target))
+    })
+
     // Hard-delete a row once it has been successfully delivered into the
     // recipient's in-process inbox. This is what makes a *claimed* row
     // (drained_at set) distinct from a *delivered* row (gone): the reaper
@@ -455,6 +471,7 @@ export const layer = Layer.effect(
       insertInbox,
       tryEnqueueWithDedup,
       claimForSessions,
+      pendingTargets,
       deleteInbox,
       reapStale,
       countUndelivered,

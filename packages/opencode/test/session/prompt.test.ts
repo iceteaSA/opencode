@@ -743,7 +743,7 @@ noLLMServer.live("a background child waits after its parent releases its own lea
       .pipe(Effect.forkChild)
     yield* Deferred.await(holderEntered)
     const parentScope = yield* Scope.Scope
-    const spawned = yield* Deferred.make<Fiber.Fiber<SessionV1.WithParts>>()
+    const spawned = yield* Deferred.make<Fiber.Fiber<SessionV1.WithParts, SessionRunState.LeaseLostError>>()
     yield* firstRun.ensureRunning(
       parent.id,
       Effect.succeed(result),
@@ -1014,7 +1014,9 @@ it.instance(
       yield* user(chat.id, "after takeover").pipe(Effect.provide(second))
       yield* llm.text("old owner must not answer")
       yield* Effect.promise(() => Bun.write(release, "go"))
-      yield* awaitWithTimeout(Fiber.join(a), "old holder did not exit", "10 seconds")
+      const lost = yield* awaitWithTimeout(Fiber.await(a), "old holder did not exit", "10 seconds")
+      expect(Exit.isFailure(lost)).toBe(true)
+      if (Exit.isFailure(lost)) expect(Cause.pretty(lost.cause)).toContain("another opencode process took over")
       const messages = yield* sessions.messages({ sessionID: chat.id }).pipe(Effect.provide(first))
       const toolPart = messages
         .flatMap((item) => item.parts)
@@ -1072,7 +1074,9 @@ it.instance(
         .pipe(Effect.provideService(Scope.Scope, nextScope))
       expect(Option.isSome(stolen)).toBe(true)
       release.resolve(undefined)
-      yield* awaitWithTimeout(Fiber.join(a), "holder did not exit after lease loss", "10 seconds")
+      const lost = yield* awaitWithTimeout(Fiber.await(a), "holder did not exit after lease loss", "10 seconds")
+      expect(Exit.isFailure(lost)).toBe(true)
+      if (Exit.isFailure(lost)) expect(Cause.pretty(lost.cause)).toContain("another opencode process took over")
       expect(yield* llm.hits).toHaveLength(1)
       expect(JSON.stringify(warnings)).toContain("session run lease lost")
       expect(JSON.stringify(warnings)).toContain(chat.id)

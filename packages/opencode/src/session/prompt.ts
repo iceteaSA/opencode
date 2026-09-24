@@ -114,10 +114,16 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
 
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
-  readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
-  readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
-  readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
-  readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly prompt: (
+    input: PromptInput,
+  ) => Effect.Effect<SessionV1.WithParts, Image.Error | SessionRunState.LeaseLostError>
+  readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts, SessionRunState.LeaseLostError>
+  readonly shell: (
+    input: ShellInput,
+  ) => Effect.Effect<SessionV1.WithParts, Session.BusyError | SessionRunState.LeaseLostError>
+  readonly command: (
+    input: CommandInput,
+  ) => Effect.Effect<SessionV1.WithParts, Image.Error | SessionRunState.LeaseLostError>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
 }
 
@@ -166,7 +172,12 @@ export const layer = Layer.effect(
         cancel: (sessionID: SessionID) => cancel(sessionID),
         cancelRun: (sessionID: SessionID) => cancelRun(sessionID),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
-        prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
+        prompt: (input: PromptInput) =>
+          prompt(input).pipe(
+            Effect.catch((error) =>
+              error instanceof SessionRunState.LeaseLostError ? Effect.fail(error) : Effect.die(error),
+            ),
+          ),
       } satisfies TaskPromptOps
     })
 
@@ -1104,13 +1115,24 @@ export const layer = Layer.effect(
       return { info, parts }
     }, Effect.scoped)
 
-    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn(
+    const prompt: (
+      input: PromptInput,
+    ) => Effect.Effect<SessionV1.WithParts, Image.Error | SessionRunState.LeaseLostError> = Effect.fn(
       "SessionPrompt.prompt",
     )(function* (input: PromptInput) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       yield* revert.cleanup(session)
       const message = yield* createUserMessage(input)
       yield* sessions.touch(input.sessionID)
+      // The process that persists a human user message owns its s2s mail;
+      // a later loop wake can originate elsewhere and cannot establish ownership.
+      if (flags.experimentalS2S && !Marker.isMachineGeneratedUser(message.parts)) {
+        yield* messaging.registerLocal(input.sessionID, message.info.id).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("s2s registration failed", { sessionID: input.sessionID, cause: Cause.pretty(cause) }),
+          ),
+        )
+      }
 
       const permissions: PermissionV1.Rule[] = []
       for (const [t, enabled] of Object.entries(input.tools ?? {})) {
@@ -1133,8 +1155,8 @@ export const layer = Layer.effect(
       throw new Error("Impossible")
     })
 
-    const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
-      function* (sessionID: SessionID) {
+    const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts, SessionRunState.LeaseLostError> =
+      Effect.fn("SessionPrompt.run")(function* (sessionID: SessionID) {
         const ctx = yield* InstanceState.context
         let structured: unknown
         let step = 0
@@ -1144,7 +1166,7 @@ export const layer = Layer.effect(
         while (true) {
           if (!(yield* state.owns(sessionID))) {
             yield* Effect.logWarning("session run lease lost", { "session.id": sessionID })
-            break
+            return yield* new SessionRunState.LeaseLostError({ sessionID })
           }
           yield* status.set(sessionID, { type: "busy" })
           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
@@ -1227,6 +1249,7 @@ export const layer = Layer.effect(
             // D — s2s drain: atomically claim s2s_inbox rows for THIS session
             // and enqueue into the in-process inbox so the drain below picks them
             // up. serviceOption keeps S2SStore out of the static layer requirement.
+            // This drain runs inside the active turn's lease, unlike the idle poller.
             if (flags.experimentalS2S) {
               yield* Effect.suspend(() =>
                 Effect.gen(function* () {
@@ -1662,12 +1685,11 @@ export const layer = Layer.effect(
 
         yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
         return yield* lastAssistant(sessionID)
-      },
-    )
+      })
 
-    const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
-      input: LoopInput,
-    ) {
+    const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts, SessionRunState.LeaseLostError> = Effect.fn(
+      "SessionPrompt.loop",
+    )(function* (input: LoopInput) {
       // Wake-on-message registration. Must run HERE (inside a fiber that
       // already has InstanceRef from the caller — an HTTP request or CLI
       // run), not at layer-build time: Messaging.registerWakeHandler reads
@@ -1679,23 +1701,10 @@ export const layer = Layer.effect(
       // is a task.ts/coordinator-messaging feature, not an s2s one.
       yield* messaging.registerWakeHandler((sessionID) => loop({ sessionID }).pipe(Effect.ignore))
 
-      // Task 9, Seam 2 — register-on-run. Cover the case of an existing
-      // session opened in a fresh process (e.g. the user re-opens a session
-      // in a new OC instance): the session is not yet in this process's local
-      // set, so its wake-poller would never claim its s2s_inbox rows.
-      // Registering on run closes the gap — a process only claims a session
-      // when it actually runs it (the anti-over-claim invariant: an idle
-      // session open in another window is never claimed here). Idempotent
-      // (registerLocal is Set.add). s2s addresses peers by session_id, so NO
-      // slug registration happens here — the slug→SessionID registry is owned
-      // solely by coordinator-messaging (task.ts).
-      //
-      // Gated on experimentalS2S so the s2s lifecycle is dead code when the
-      // flag is off (matches the poller gate — same semantic).
+      // An injected wake can run in any process; ownership is registered when
+      // that process persists a human prompt, not when its loop starts.
       if (flags.experimentalS2S) {
         yield* Effect.gen(function* () {
-          yield* messaging.registerLocal(input.sessionID)
-
           // C′ — ensure one wake-poller fiber per instance directory, forked via
           // `attach` so it captures the loop fiber's InstanceRef. The fork
           // provides Database explicitly; S2SStore/Messaging/SessionStatus are
@@ -1735,7 +1744,9 @@ export const layer = Layer.effect(
       return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
     })
 
-    const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
+    const shell: (
+      input: ShellInput,
+    ) => Effect.Effect<SessionV1.WithParts, Session.BusyError | SessionRunState.LeaseLostError> = Effect.fn(
       "SessionPrompt.shell",
     )(function* (input: ShellInput) {
       const ready = yield* Latch.make()

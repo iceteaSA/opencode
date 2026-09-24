@@ -44,6 +44,7 @@
 // merged layer's R surfaced as "Service not found" at the first
 // `yield*`). The standalone helper keeps the dependency local.
 
+import { isLocalForLatestUser } from "@/s2s/local-owner"
 import { Effect, Option, Schema } from "effect"
 import * as Tool from "./tool"
 import { Messaging, AbuseError, INBOX_CAP, S2S_HOURLY_OUTBOUND_CAP } from "../messaging"
@@ -190,7 +191,7 @@ export const S2STool = Tool.define<typeof Parameters, Metadata, Messaging.Servic
           // source="sibling-session" so the drain renders <external-context>.
           // Bypasses the s2s_inbox table and the hourly outbound cap (both
           // for cross-process only).
-          const inProcess = yield* messaging.isLocal(targetID)
+          const inProcess = yield* isLocalForLatestUser(targetID, messaging, sessions)
           if (inProcess) {
             yield* messaging
               .enqueue({

@@ -1757,6 +1757,56 @@ describe("tool.task", () => {
     }),
   )
 
+  background.instance("a child prompt that loses its lease reports a task error rather than empty completion", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const injected = defer<SessionPrompt.PromptInput>()
+      const result = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+          background: true,
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: {
+            promptOps: {
+              ...stubOps(),
+              prompt: (input) =>
+                input.sessionID === chat.id
+                  ? Effect.sync(() => {
+                      injected.resolve(input)
+                      return reply(input, "injected")
+                    })
+                  : Effect.fail(new SessionRunState.LeaseLostError({ sessionID: input.sessionID })),
+            } satisfies TaskPromptOps,
+          },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
+      expect(waited.info?.status).toBe("error")
+      const notification = yield* Effect.promise(() => injected.promise)
+      expect(notification.parts[0]?.type).toBe("text")
+      if (notification.parts[0]?.type === "text") {
+        expect(notification.parts[0].text).toContain('state="error"')
+        expect(notification.parts[0].text).toContain("<task_error>")
+        expect(notification.parts[0].text).toContain("another opencode process took over")
+        expect(notification.parts[0].text).not.toContain('state="completed"')
+      }
+    }),
+  )
+
   background.instance("background task completion does not wait for the parent async prompt", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
@@ -2791,6 +2841,51 @@ const itBroken = testEffect(Layer.provideMerge(brokenSessionLayer, withRipgrep()
       expect((prompts[1]?.model?.modelID ?? "") as string).toBe("gpt-4o")
       expect(result.output).toContain("fallback says hi")
       expect((result.metadata as { fallback_used?: boolean }).fallback_used).toBe(true)
+    }),
+  )
+
+  background.instance("does not fall back when the child prompt loses its session lease", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const prompts: SessionPrompt.PromptInput[] = []
+      const result = yield* def.execute(
+        {
+          description: "d",
+          prompt: "p",
+          subagent_type: "general",
+          background: true,
+          fallback_model: "openai/gpt-4o",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: {
+            promptOps: {
+              ...stubOps(),
+              prompt: (input) => {
+                if (input.sessionID === chat.id) return Effect.succeed(reply(input, "injected"))
+                prompts.push(input)
+                return Effect.fail(new SessionRunState.LeaseLostError({ sessionID: input.sessionID }))
+              },
+            } satisfies TaskPromptOps,
+          },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
+      expect(waited.info?.status).toBe("error")
+      expect(prompts).toHaveLength(1)
+      expect(prompts[0]?.model?.providerID).toBe(ref.providerID)
+      expect(prompts[0]?.model?.modelID).toBe(ref.modelID)
+      expect((result.metadata as { fallback_used?: boolean }).fallback_used).toBeUndefined()
     }),
   )
 
