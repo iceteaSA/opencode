@@ -1,7 +1,7 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Deferred, Duration, Effect, Layer, Schema, Context, Option } from "effect"
 import { InstanceState } from "@/effect/instance-state"
-import { SessionID } from "@/session/schema"
+import { MessageID, SessionID } from "@/session/schema"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { MessagingEvent } from "@opencode-ai/schema/messaging-event"
 
@@ -80,10 +80,9 @@ interface State {
   outbound: Map<SessionID, number>
   waiters: Map<SessionID, Deferred.Deferred<void>>
   treeTotal: { count: number }
-  // Set of SessionIDs that live in THIS process. The cross-session poller
-  // consults this to decide whether a wake can be served by an in-process
-  // drain (local) or must be persisted to the s2s_inbox table (remote).
-  local: Set<SessionID>
+  // Message IDs fence ownership after the person continues in another process.
+  // Entries without one preserve registrations made outside SessionPrompt.loop.
+  local: Map<SessionID, MessageID | undefined>
 }
 
 export interface Interface {
@@ -116,11 +115,8 @@ export interface Interface {
     source?: "sibling-session"
   }) => Effect.Effect<void, AbuseError>
   readonly drain: (sessionID: SessionID) => Effect.Effect<ReadonlyArray<InboxItem>>
-  readonly awaitInbox: (
-    sessionID: SessionID,
-    opts: { timeoutMs: number },
-  ) => Effect.Effect<boolean>
-  readonly registerLocal: (sessionID: SessionID) => Effect.Effect<void>
+  readonly awaitInbox: (sessionID: SessionID, opts: { timeoutMs: number }) => Effect.Effect<boolean>
+  readonly registerLocal: (sessionID: SessionID, messageID?: MessageID) => Effect.Effect<void>
   readonly isLocal: (sessionID: SessionID) => Effect.Effect<boolean>
   readonly localSet: () => Effect.Effect<ReadonlyArray<SessionID>>
 }
@@ -143,7 +139,7 @@ export const layer = Layer.effect(
           outbound: new Map<SessionID, number>(),
           waiters: new Map<SessionID, Deferred.Deferred<void>>(),
           treeTotal: { count: 0 },
-          local: new Set<SessionID>(),
+          local: new Map<SessionID, MessageID | undefined>(),
         }
         yield* Effect.addFinalizer(() =>
           Effect.gen(function* () {
@@ -202,7 +198,8 @@ export const layer = Layer.effect(
       const release = Effect.sync(() => {
         value.pending.delete(input.childSessionID)
         const current = value.counters.get(input.childSessionID)
-        if (current) value.counters.set(input.childSessionID, { ...current, inFlight: Math.max(0, current.inFlight - 1) })
+        if (current)
+          value.counters.set(input.childSessionID, { ...current, inFlight: Math.max(0, current.inFlight - 1) })
       })
 
       // expect_reply path: the publish must run INSIDE the protected block so
@@ -225,9 +222,7 @@ export const layer = Layer.effect(
           })
 
           yield* input.deliver
-          const result = yield* Deferred.await(deferred).pipe(
-            Effect.timeoutOption(input.timeout ?? DEFAULT_TIMEOUT),
-          )
+          const result = yield* Deferred.await(deferred).pipe(Effect.timeoutOption(input.timeout ?? DEFAULT_TIMEOUT))
           if (Option.isNone(result)) return yield* new ReplyTimeoutError({ childSessionID: input.childSessionID })
           return Option.some(result.value)
         }),
@@ -355,10 +350,7 @@ export const layer = Layer.effect(
       return q
     })
 
-    const awaitInbox: Interface["awaitInbox"] = Effect.fn("Messaging.awaitInbox")(function* (
-      sessionID,
-      opts,
-    ) {
+    const awaitInbox: Interface["awaitInbox"] = Effect.fn("Messaging.awaitInbox")(function* (sessionID, opts) {
       // Bounded behaviors (Phase 1):
       //   (i) Lost-wakeup window: the empty-check at line 1 and the waiter
       //       registration at line 2 are not atomic. A concurrent `enqueue` that
@@ -384,10 +376,12 @@ export const layer = Layer.effect(
       return Option.isSome(woke)
     })
 
-    const registerLocal: Interface["registerLocal"] = Effect.fn("Messaging.registerLocal")(function* (sessionID) {
-      const v = yield* InstanceState.get(state)
-      v.local.add(sessionID)
-    })
+    const registerLocal: Interface["registerLocal"] = Effect.fn("Messaging.registerLocal")(
+      function* (sessionID, messageID) {
+        const v = yield* InstanceState.get(state)
+        v.local.set(sessionID, messageID)
+      },
+    )
 
     const isLocal: Interface["isLocal"] = Effect.fn("Messaging.isLocal")(function* (sessionID) {
       const v = yield* InstanceState.get(state)
@@ -396,7 +390,7 @@ export const layer = Layer.effect(
 
     const localSet: Interface["localSet"] = Effect.fn("Messaging.localSet")(function* () {
       const v = yield* InstanceState.get(state)
-      return [...v.local]
+      return [...v.local.keys()]
     })
 
     return Service.of({

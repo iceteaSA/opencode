@@ -72,7 +72,7 @@ import { SystemPrompt } from "@/session/system"
 import { Todo } from "@/session/todo"
 import { ToolRegistry } from "@/tool/registry"
 import { Truncate } from "@/tool/truncate"
-import { SessionID } from "../../src/session/schema"
+import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { TestInstance, disposeAllInstances } from "../fixture/fixture"
 import { testEffectIsolatedShared } from "../lib/effect"
 import { TestLLMServer } from "../lib/llm-server"
@@ -152,8 +152,16 @@ const lspStub = Layer.succeed(
   }),
 )
 
-const statusNode = LayerNode.make({ service: SessionStatus.Service, layer: SessionStatus.layer, deps: [EventV2Bridge.node] })
-const runStateNode = LayerNode.make({ service: SessionRunState.Service, layer: SessionRunState.layer, deps: [BackgroundJob.node, statusNode] })
+const statusNode = LayerNode.make({
+  service: SessionStatus.Service,
+  layer: SessionStatus.layer,
+  deps: [EventV2Bridge.node],
+})
+const runStateNode = LayerNode.make({
+  service: SessionRunState.Service,
+  layer: SessionRunState.layer,
+  deps: [BackgroundJob.node, statusNode],
+})
 
 // experimentalS2S: true is the load-bearing difference from wakeup-spike — it
 // gates the C′ fork in SessionPrompt.loop.
@@ -369,5 +377,140 @@ describe("s2s C′ wake-poller: forked-from-loop claims a DB row on an idle sess
       }),
     // 2s fixed wait + setup; keep above the 5000ms default for batch slack.
     15000,
+  )
+})
+
+describe("s2s local ownership follows the latest user turn", () => {
+  it.instance("does not claim a foreign human message merely by running its loop", () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfgFor)
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const messaging = yield* Messaging.Service
+      const chat = yield* sessions.create({ title: "foreign human prompt" })
+      const messageID = MessageID.ascending()
+      yield* sessions.updateMessage({
+        id: messageID,
+        sessionID: chat.id,
+        role: "user",
+        agent: "build",
+        model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") },
+        time: { created: Date.now() },
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID,
+        sessionID: chat.id,
+        type: "text",
+        text: "from another process",
+      })
+      yield* llm.text("reply")
+
+      yield* prompt.loop({ sessionID: chat.id })
+
+      expect(yield* messaging.localSet()).not.toContain(chat.id)
+    }),
+  )
+  it.instance("does not claim a session whose latest user turn is all synthetic or marker-tagged", () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfgFor)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const messaging = yield* Messaging.Service
+      const chat = yield* sessions.create({ title: "injected-only turn" })
+
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [
+          { type: "text", text: "injected", synthetic: true },
+          { type: "text", text: "notice", metadata: { marker: { kind: "inbox" } } },
+        ],
+      })
+      expect(yield* messaging.localSet()).not.toContain(chat.id)
+      yield* llm.text("reply")
+      yield* prompt.loop({ sessionID: chat.id })
+
+      expect(yield* messaging.localSet()).not.toContain(chat.id)
+    }),
+  )
+
+  it.instance("claims a session after a plain human prompt", () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfgFor)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const messaging = yield* Messaging.Service
+      const chat = yield* sessions.create({ title: "human turn" })
+
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "hello" }],
+      })
+      expect(yield* messaging.localSet()).toContain(chat.id)
+      yield* llm.text("reply")
+      yield* prompt.loop({ sessionID: chat.id })
+
+      expect(yield* messaging.localSet()).toContain(chat.id)
+    }),
+  )
+
+  it.instance("claims a task-style turn with plain text and synthetic context", () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfgFor)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const messaging = yield* Messaging.Service
+      const chat = yield* sessions.create({ title: "task turn" })
+
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [
+          { type: "text", text: "do the task" },
+          { type: "text", text: "task context", synthetic: true },
+        ],
+      })
+      expect(yield* messaging.localSet()).toContain(chat.id)
+      yield* llm.text("reply")
+      yield* prompt.loop({ sessionID: chat.id })
+
+      expect(yield* messaging.localSet()).toContain(chat.id)
+    }),
+  )
+
+  it.instance("keeps an existing local entry after an injected user turn", () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfgFor)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const messaging = yield* Messaging.Service
+      const chat = yield* sessions.create({ title: "human then injected" })
+
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "hello" }],
+      })
+      yield* llm.text("first reply")
+      yield* prompt.loop({ sessionID: chat.id })
+      expect(yield* messaging.localSet()).toContain(chat.id)
+
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "injected", synthetic: true }],
+      })
+      yield* llm.text("second reply")
+      yield* prompt.loop({ sessionID: chat.id })
+
+      expect(yield* messaging.localSet()).toContain(chat.id)
+    }),
   )
 })
