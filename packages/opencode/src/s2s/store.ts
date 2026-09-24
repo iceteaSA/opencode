@@ -127,6 +127,7 @@ export interface AllowRow {
 export interface Interface {
   readonly insertInbox: (row: NewInboxRow) => Effect.Effect<void, S2SStoreError>
   readonly claimForSessions: (ids: ReadonlyArray<SessionID>) => Effect.Effect<InboxRow[], S2SStoreError>
+  readonly pendingTargets: (ids: ReadonlyArray<SessionID>) => Effect.Effect<SessionID[], S2SStoreError>
   readonly deleteInbox: (id: string) => Effect.Effect<void, S2SStoreError>
   readonly reapStale: (olderThan: number) => Effect.Effect<void, S2SStoreError>
   readonly countUndelivered: (target: SessionID) => Effect.Effect<number, S2SStoreError>
@@ -211,21 +212,37 @@ export const layer = Layer.effect(
       )
     })
 
-    const claimForSessions: Interface["claimForSessions"] = Effect.fn("S2SStore.claimForSessions")(
-      function* (ids) {
-        if (ids.length === 0) return []
-        const claimed = yield* query(
-          db.all<InboxDbRow>(sql`
+    const claimForSessions: Interface["claimForSessions"] = Effect.fn("S2SStore.claimForSessions")(function* (ids) {
+      if (ids.length === 0) return []
+      const claimed = yield* query(
+        db.all<InboxDbRow>(sql`
             UPDATE s2s_inbox
             SET drained_at = ${Date.now()}
-            WHERE target_session_id IN (${sql.join(ids.map((id) => sql`${id}`), sql`, `)})
+            WHERE target_session_id IN (${sql.join(
+              ids.map((id) => sql`${id}`),
+              sql`, `,
+            )})
               AND drained_at IS NULL
             RETURNING id, target_session_id, from_session_id, from_slug, capsule, time_created
           `),
-        )
-        return claimed.map(toInboxRow)
-      },
-    )
+      )
+      return claimed.map(toInboxRow)
+    })
+
+    const pendingTargets: Interface["pendingTargets"] = Effect.fn("S2SStore.pendingTargets")(function* (ids) {
+      if (ids.length === 0) return []
+      const rows = yield* query(
+        db.all<{ target: string }>(sql`
+          SELECT DISTINCT target_session_id AS target FROM s2s_inbox
+          WHERE target_session_id IN (${sql.join(
+            ids.map((id) => sql`${id}`),
+            sql`, `,
+          )})
+            AND drained_at IS NULL
+        `),
+      )
+      return rows.map((row) => SessionID.make(row.target))
+    })
 
     // Hard-delete a row once it has been successfully delivered into the
     // recipient's in-process inbox. This is what makes a *claimed* row
@@ -251,17 +268,15 @@ export const layer = Layer.effect(
       )
     })
 
-    const countUndelivered: Interface["countUndelivered"] = Effect.fn("S2SStore.countUndelivered")(
-      function* (target) {
-        const row = yield* query(
-          db.get<{ n: number }>(sql`
+    const countUndelivered: Interface["countUndelivered"] = Effect.fn("S2SStore.countUndelivered")(function* (target) {
+      const row = yield* query(
+        db.get<{ n: number }>(sql`
             SELECT COUNT(*) AS n FROM s2s_inbox
             WHERE target_session_id = ${target} AND drained_at IS NULL
           `),
-        )
-        return row?.n ?? 0
-      },
-    )
+      )
+      return row?.n ?? 0
+    })
 
     const insertToken: Interface["insertToken"] = Effect.fn("S2SStore.insertToken")(function* (row) {
       yield* query(
@@ -327,33 +342,32 @@ export const layer = Layer.effect(
     // the session table. A session row is always created BEFORE any s2s row
     // can reference it (synchronous at session creation), so NOT IN cannot
     // race-delete rows that belong to a live, newly created session.
-    const deleteOrphaned: Interface["deleteOrphaned"] = Effect.fn("S2SStore.deleteOrphaned")(
-      function* () {
-        yield* query(
-          db.run(sql`
+    const deleteOrphaned: Interface["deleteOrphaned"] = Effect.fn("S2SStore.deleteOrphaned")(function* () {
+      yield* query(
+        db.run(sql`
             DELETE FROM s2s_inbox
             WHERE target_session_id NOT IN (SELECT id FROM session)
           `),
-        )
-        yield* query(
-          db.run(sql`
+      )
+      yield* query(
+        db.run(sql`
             DELETE FROM s2s_allow
             WHERE session_id NOT IN (SELECT id FROM session)
                OR allowed_session_id NOT IN (SELECT id FROM session)
           `),
-        )
-        yield* query(
-          db.run(sql`
+      )
+      yield* query(
+        db.run(sql`
             DELETE FROM s2s_token
             WHERE inviter_session_id NOT IN (SELECT id FROM session)
           `),
-        )
-      },
-    )
+      )
+    })
 
     return {
       insertInbox,
       claimForSessions,
+      pendingTargets,
       deleteInbox,
       reapStale,
       countUndelivered,

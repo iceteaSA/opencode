@@ -56,7 +56,9 @@ const it = testEffectIsolatedShared(
       drain: () => Effect.die("unexpected Messaging.drain"),
       awaitInbox: () => Effect.die("unexpected Messaging.awaitInbox"),
       registerLocal: () => Effect.die("unexpected Messaging.registerLocal"),
-      isLocal: () => Effect.die("unexpected Messaging.isLocal"),
+      isLocal: () => Effect.succeed(true),
+      localMessageID: () => Effect.succeed(undefined),
+      isLocalFor: () => Effect.die("unexpected Messaging.isLocalFor"),
       localSet: () => Effect.succeed([target]),
     }),
   ).pipe(Layer.provide(Database.layerFromPath(":memory:"))),
@@ -77,7 +79,7 @@ it.instance("stops retrying a deterministically failing row within the process l
     })
 
     for (let i = 0; i < 6; i++) {
-      yield* (pollOnceImpl() as unknown as Effect.Effect<void, S2SStore.S2SStoreError>)
+      yield* pollOnceImpl() as unknown as Effect.Effect<void, S2SStore.S2SStoreError>
       yield* store.reapStale(Date.now() + 10 ** 9)
     }
 
@@ -104,7 +106,7 @@ it.instance("bounds failure tracking across distinct failing rows", () =>
     }
 
     for (let i = 0; i < 4; i++) {
-      yield* (pollOnceImpl() as unknown as Effect.Effect<void, S2SStore.S2SStoreError>)
+      yield* pollOnceImpl() as unknown as Effect.Effect<void, S2SStore.S2SStoreError>
       yield* store.reapStale(Date.now() + 10 ** 9)
     }
 
@@ -128,7 +130,7 @@ it.instance("clears a row failure count after successful delivery", () =>
     })
 
     for (let i = 0; i < 3; i++) {
-      yield* (pollOnceImpl() as unknown as Effect.Effect<void, S2SStore.S2SStoreError>)
+      yield* pollOnceImpl() as unknown as Effect.Effect<void, S2SStore.S2SStoreError>
       yield* store.reapStale(Date.now() + 10 ** 9)
     }
 
@@ -142,7 +144,7 @@ it.instance("clears a row failure count after successful delivery", () =>
     })
 
     for (let i = 0; i < 2; i++) {
-      yield* (pollOnceImpl() as unknown as Effect.Effect<void, S2SStore.S2SStoreError>)
+      yield* pollOnceImpl() as unknown as Effect.Effect<void, S2SStore.S2SStoreError>
       yield* store.reapStale(Date.now() + 10 ** 9)
     }
 

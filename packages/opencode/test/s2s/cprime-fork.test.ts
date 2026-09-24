@@ -411,6 +411,38 @@ describe("s2s local ownership follows the latest user turn", () => {
       expect(yield* messaging.localSet()).not.toContain(chat.id)
     }),
   )
+  it.instance("re-registers the newer human message after a local turn", () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfgFor)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const messaging = yield* Messaging.Service
+      const chat = yield* sessions.create({ title: "same-process second turn" })
+      const first = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "first" }],
+      })
+      expect(yield* messaging.localMessageID(chat.id)).toBe(first.info.id)
+      yield* llm.text("first reply")
+      yield* prompt.loop({ sessionID: chat.id })
+      expect(yield* messaging.localMessageID(chat.id)).toBe(first.info.id)
+
+      const second = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "second" }],
+      })
+      expect(yield* messaging.localMessageID(chat.id)).toBe(second.info.id)
+      yield* llm.text("second reply")
+      yield* prompt.loop({ sessionID: chat.id })
+
+      expect(yield* messaging.localMessageID(chat.id)).toBe(second.info.id)
+      expect(yield* messaging.localSet()).toContain(chat.id)
+    }),
+  )
   it.instance("does not claim a session whose latest user turn is all synthetic or marker-tagged", () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(providerCfgFor)

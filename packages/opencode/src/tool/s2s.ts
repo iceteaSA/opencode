@@ -44,6 +44,7 @@
 // merged layer's R surfaced as "Service not found" at the first
 // `yield*`). The standalone helper keeps the dependency local.
 
+import { isLocalForLatestUser } from "@/s2s/local-owner"
 import { Effect, Option, Schema } from "effect"
 import * as Tool from "./tool"
 import { Messaging, AbuseError, INBOX_CAP, S2S_HOURLY_OUTBOUND_CAP } from "../messaging"
@@ -90,11 +91,7 @@ type Metadata = {
   peers?: Peer[]
 }
 
-export const S2STool = Tool.define<
-  typeof Parameters,
-  Metadata,
-  Messaging.Service | Session.Service | S2SStore.Service
->(
+export const S2STool = Tool.define<typeof Parameters, Metadata, Messaging.Service | Session.Service | S2SStore.Service>(
   "s2s",
   Effect.gen(function* () {
     const messaging = yield* Messaging.Service
@@ -139,8 +136,7 @@ export const S2STool = Tool.define<
         }
 
         case "accept": {
-          if (!params.token)
-            return yield* Effect.fail(new Error('s2s(command:"accept") requires a token'))
+          if (!params.token) return yield* Effect.fail(new Error('s2s(command:"accept") requires a token'))
           const claimed = yield* store.claimToken(params.token, ctx.sessionID)
           if (Option.isNone(claimed))
             return yield* Effect.fail(
@@ -168,8 +164,7 @@ export const S2STool = Tool.define<
         case "msg": {
           if (!params.target)
             return yield* Effect.fail(new Error('s2s(command:"msg") requires target=<peer-session-id>'))
-          if (!params.body)
-            return yield* Effect.fail(new Error('s2s(command:"msg") requires body="..."'))
+          if (!params.body) return yield* Effect.fail(new Error('s2s(command:"msg") requires body="..."'))
           if (params.body.length > MAX_BODY_LENGTH)
             return yield* Effect.fail(
               new Error(`s2s body exceeds maximum length of ${MAX_BODY_LENGTH} characters (got ${params.body.length})`),
@@ -178,8 +173,7 @@ export const S2STool = Tool.define<
           // Addressing is by session_id. The target string IS the peer's
           // SessionID — no slug resolution (session.slug is not unique).
           const targetID = SessionID.make(params.target)
-          if (targetID === ctx.sessionID)
-            return yield* Effect.fail(new Error("s2s msg: cannot send to self"))
+          if (targetID === ctx.sessionID) return yield* Effect.fail(new Error("s2s msg: cannot send to self"))
 
           // Consent: the durable s2s_allow table (session_id based) is the
           // single authority. `isAllowed(me, target)` is true iff we
@@ -197,7 +191,7 @@ export const S2STool = Tool.define<
           // source="sibling-session" so the drain renders <external-context>.
           // Bypasses the s2s_inbox table and the hourly outbound cap (both
           // for cross-process only).
-          const inProcess = yield* messaging.isLocal(targetID)
+          const inProcess = yield* isLocalForLatestUser(targetID, messaging, sessions)
           if (inProcess) {
             yield* messaging
               .enqueue({

@@ -118,6 +118,8 @@ export interface Interface {
   readonly awaitInbox: (sessionID: SessionID, opts: { timeoutMs: number }) => Effect.Effect<boolean>
   readonly registerLocal: (sessionID: SessionID, messageID?: MessageID) => Effect.Effect<void>
   readonly isLocal: (sessionID: SessionID) => Effect.Effect<boolean>
+  readonly localMessageID: (sessionID: SessionID) => Effect.Effect<MessageID | undefined>
+  readonly isLocalFor: (sessionID: SessionID, latestHumanID: MessageID) => Effect.Effect<boolean>
   readonly localSet: () => Effect.Effect<ReadonlyArray<SessionID>>
 }
 
@@ -388,6 +390,20 @@ export const layer = Layer.effect(
       return v.local.has(sessionID)
     })
 
+    const localMessageID: Interface["localMessageID"] = Effect.fn("Messaging.localMessageID")(function* (sessionID) {
+      const v = yield* InstanceState.get(state)
+      return v.local.get(sessionID)
+    })
+
+    const isLocalFor: Interface["isLocalFor"] = Effect.fn("Messaging.isLocalFor")(function* (sessionID, latestHumanID) {
+      const v = yield* InstanceState.get(state)
+      if (!v.local.has(sessionID)) return false
+      const recorded = v.local.get(sessionID)
+      if (recorded === undefined || recorded === latestHumanID) return true
+      v.local.delete(sessionID)
+      return false
+    })
+
     const localSet: Interface["localSet"] = Effect.fn("Messaging.localSet")(function* () {
       const v = yield* InstanceState.get(state)
       return [...v.local.keys()]
@@ -408,6 +424,8 @@ export const layer = Layer.effect(
       awaitInbox,
       registerLocal,
       isLocal,
+      localMessageID,
+      isLocalFor,
       localSet,
     })
   }),
