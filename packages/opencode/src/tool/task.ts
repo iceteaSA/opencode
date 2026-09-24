@@ -15,7 +15,7 @@ import { Messaging } from "../messaging"
 import { SessionRunState } from "../session/run-state"
 import { Config } from "@/config/config"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
-import { Effect, Exit, Option, Schema, Scope } from "effect"
+import { Cause, Effect, Exit, Option, Schema, Scope } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
@@ -534,7 +534,13 @@ export const TaskTool = Tool.define(
         // The timeout interrupts the await, not the child runner; cancelRun stops that
         // runner without canceling the enclosing background job.
         yield* cancelRun()
-        if (Exit.hasInterrupts(exit) || Exit.hasDies(exit) || fallbackModel === undefined)
+        const error = Option.getOrUndefined(Cause.findErrorOption(exit.cause))
+        if (
+          Exit.hasInterrupts(exit) ||
+          Exit.hasDies(exit) ||
+          error instanceof SessionRunState.LeaseLostError ||
+          fallbackModel === undefined
+        )
           return yield* Effect.failCause(exit.cause)
         fallbackUsed = true
         const fallbackExit = yield* Effect.exit(attempt(fallbackModel, params.variant ?? resumedVariant))

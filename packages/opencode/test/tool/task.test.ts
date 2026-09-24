@@ -2844,6 +2844,51 @@ const itBroken = testEffect(Layer.provideMerge(brokenSessionLayer, withRipgrep()
     }),
   )
 
+  background.instance("does not fall back when the child prompt loses its session lease", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const prompts: SessionPrompt.PromptInput[] = []
+      const result = yield* def.execute(
+        {
+          description: "d",
+          prompt: "p",
+          subagent_type: "general",
+          background: true,
+          fallback_model: "openai/gpt-4o",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: {
+            promptOps: {
+              ...stubOps(),
+              prompt: (input) => {
+                if (input.sessionID === chat.id) return Effect.succeed(reply(input, "injected"))
+                prompts.push(input)
+                return Effect.fail(new SessionRunState.LeaseLostError({ sessionID: input.sessionID }))
+              },
+            } satisfies TaskPromptOps,
+          },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
+      expect(waited.info?.status).toBe("error")
+      expect(prompts).toHaveLength(1)
+      expect(prompts[0]?.model?.providerID).toBe(ref.providerID)
+      expect(prompts[0]?.model?.modelID).toBe(ref.modelID)
+      expect((result.metadata as { fallback_used?: boolean }).fallback_used).toBeUndefined()
+    }),
+  )
+
   it.instance("cancels the child runner when the fallback attempt fails", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seed()
