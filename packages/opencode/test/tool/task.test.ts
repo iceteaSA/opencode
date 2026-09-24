@@ -2889,6 +2889,56 @@ const itBroken = testEffect(Layer.provideMerge(brokenSessionLayer, withRipgrep()
     }),
   )
 
+  background.instance("cancels and reports a fallback attempt that loses its session lease", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const prompts: SessionPrompt.PromptInput[] = []
+      const cancelRuns: number[] = []
+      const result = yield* def.execute(
+        {
+          description: "d",
+          prompt: "p",
+          subagent_type: "general",
+          timeout: 100,
+          background: true,
+          fallback_model: "openai/gpt-4o",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: {
+            promptOps: {
+              ...stubOps(),
+              cancelRun: () => Effect.sync(() => { cancelRuns.push(1) }),
+              prompt: (input) => {
+                if (input.sessionID === chat.id) return Effect.succeed(reply(input, "injected"))
+                prompts.push(input)
+                if (prompts.length === 1) return Effect.never
+                return Effect.fail(new SessionRunState.LeaseLostError({ sessionID: input.sessionID }))
+              },
+            } satisfies TaskPromptOps,
+          },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
+      expect(waited.info?.status).toBe("error")
+      expect(waited.info?.error).toContain("another opencode process took over")
+      expect(prompts).toHaveLength(2)
+      expect((prompts[1]?.model?.providerID ?? "") as string).toBe("openai")
+      expect((prompts[1]?.model?.modelID ?? "") as string).toBe("gpt-4o")
+      expect(cancelRuns).toHaveLength(2)
+    }),
+  )
+
   it.instance("cancels the child runner when the fallback attempt fails", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seed()
