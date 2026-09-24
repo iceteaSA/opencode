@@ -12,6 +12,7 @@ import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
 import type { SessionPrompt } from "../session/prompt"
 import { writeMarker as writeMessageMarker } from "./message"
 import { Messaging } from "../messaging"
+import { SessionRunState } from "../session/run-state"
 import { Config } from "@/config/config"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { Effect, Exit, Option, Schema, Scope } from "effect"
@@ -31,7 +32,7 @@ export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
   cancelRun(sessionID: SessionID): Effect.Effect<void>
   resolvePromptParts(template: string): Effect.Effect<SessionPrompt.PromptInput["parts"]>
-  prompt(input: SessionPrompt.PromptInput): Effect.Effect<SessionV1.WithParts>
+  prompt(input: SessionPrompt.PromptInput): Effect.Effect<SessionV1.WithParts, SessionRunState.LeaseLostError>
 }
 
 export const Event = {
