@@ -201,8 +201,19 @@ export namespace EffectFlock {
             // We own the breaker — double-check staleness, nuke, recreate
             const recreated = yield* Effect.gen(function* () {
               if (!(yield* isStale(lockDir, heartbeatPath, metaPath))) return false
+              const previous = yield* fs.readFileString(metaPath).pipe(
+                Effect.map((raw) => Schema.decodeUnknownOption(LockMetaJson)(raw)),
+                Effect.orElseSucceed(() => Option.none()),
+              )
               yield* forceRemove(lockDir)
-              return yield* atomicMkdir(lockDir)
+              const recreated = yield* atomicMkdir(lockDir)
+              if (recreated) {
+                yield* Effect.logWarning("EffectFlock stale lock broken", {
+                  lockDir,
+                  pid: Option.isSome(previous) ? previous.value.pid : "unknown",
+                })
+              }
+              return recreated
             }).pipe(Effect.ensuring(forceRemove(breakerPath)))
 
             if (!recreated) return yield* new NotAcquired()
@@ -301,9 +312,11 @@ export namespace EffectFlock {
           (result) => (Option.isSome(result) ? releaseLease(result.value) : Effect.void),
         )
         if (Option.isNone(acquired)) return Option.none()
-        yield* fs
-          .utimes(acquired.value.heartbeatPath, new Date(), new Date())
-          .pipe(Effect.ignore, Effect.repeat(Schedule.spaced(HEARTBEAT_MS)), Effect.forkScoped)
+        yield* Effect.suspend(() => fs.utimes(acquired.value.heartbeatPath, new Date(), new Date())).pipe(
+          Effect.ignore,
+          Effect.repeat(Schedule.spaced(HEARTBEAT_MS)),
+          Effect.forkScoped,
+        )
         return Option.some({ verify: verify(acquired.value) })
       })
 
@@ -326,9 +339,11 @@ export namespace EffectFlock {
           acquireHandle(path.join(lockDir, Hash.fast(key) + ".lock"), key),
           (handle) => release(handle),
         )
-        yield* fs
-          .utimes(handle.heartbeatPath, new Date(), new Date())
-          .pipe(Effect.ignore, Effect.repeat(Schedule.spaced(HEARTBEAT_MS)), Effect.forkScoped)
+        yield* Effect.suspend(() => fs.utimes(handle.heartbeatPath, new Date(), new Date())).pipe(
+          Effect.ignore,
+          Effect.repeat(Schedule.spaced(HEARTBEAT_MS)),
+          Effect.forkScoped,
+        )
       })
 
       const withLock: Interface["withLock"] = Function.dual(
