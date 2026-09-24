@@ -3,7 +3,7 @@ import { InstanceState } from "@/effect/instance-state"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Runner } from "@/effect/runner"
 import { BackgroundJob } from "@/background/job"
-import { Context, Effect, Latch, Layer, Option, Scope } from "effect"
+import { Context, Effect, Latch, Layer, Option, Schema, Scope } from "effect"
 import { Session } from "./session"
 import { SessionID } from "./schema"
 import { SessionStatus } from "./status"
@@ -16,17 +16,25 @@ export interface Interface {
   readonly ensureRunning: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
-    work: Effect.Effect<SessionV1.WithParts>,
-  ) => Effect.Effect<SessionV1.WithParts>
+    work: Effect.Effect<SessionV1.WithParts, LeaseLostError>,
+  ) => Effect.Effect<SessionV1.WithParts, LeaseLostError>
   readonly startShell: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
     work: Effect.Effect<SessionV1.WithParts>,
     ready?: Latch.Latch,
-  ) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
+  ) => Effect.Effect<SessionV1.WithParts, Session.BusyError | LeaseLostError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionRunState") {}
+
+export class LeaseLostError extends Schema.TaggedErrorClass<LeaseLostError>()("SessionRunState.LeaseLostError", {
+  sessionID: SessionID,
+}) {
+  override get message() {
+    return `another opencode process took over the session run: ${this.sessionID}`
+  }
+}
 
 export const LeaseTiming = Context.Reference("@opencode/SessionRunState.LeaseTiming", {
   defaultValue: () => ({ minimum: 250, maximum: 2_000, warning: 60_000, repeat: 300_000 }),
@@ -42,7 +50,7 @@ const layer = Layer.effect(
     const state = yield* InstanceState.make(
       Effect.fn("SessionRunState.state")(function* () {
         const scope = yield* Scope.Scope
-        const runners = new Map<SessionID, Runner.Runner<SessionV1.WithParts>>()
+        const runners = new Map<SessionID, Runner.Runner<SessionV1.WithParts, LeaseLostError>>()
         const leases = new Map<SessionID, EffectFlock.Held>()
         yield* Effect.addFinalizer(
           Effect.fnUntraced(function* () {
@@ -64,7 +72,7 @@ const layer = Layer.effect(
       const data = yield* InstanceState.get(state)
       const existing = data.runners.get(sessionID)
       if (existing) return existing
-      const next = Runner.make<SessionV1.WithParts>(data.scope, {
+      const next = Runner.make<SessionV1.WithParts, LeaseLostError>(data.scope, {
         onIdle: Effect.gen(function* () {
           data.runners.delete(sessionID)
           yield* status.set(sessionID, { type: "idle" })
@@ -99,7 +107,7 @@ const layer = Layer.effect(
       return held ? yield* held.verify : true
     })
 
-    const lease = (sessionID: SessionID, work: Effect.Effect<SessionV1.WithParts>) =>
+    const lease = (sessionID: SessionID, work: Effect.Effect<SessionV1.WithParts, LeaseLostError>) =>
       Effect.scoped(
         Effect.gen(function* () {
           const data = yield* InstanceState.get(state)
@@ -138,7 +146,7 @@ const layer = Layer.effect(
     const ensureRunning = Effect.fn("SessionRunState.ensureRunning")(function* (
       sessionID: SessionID,
       onInterrupt: Effect.Effect<SessionV1.WithParts>,
-      work: Effect.Effect<SessionV1.WithParts>,
+      work: Effect.Effect<SessionV1.WithParts, LeaseLostError>,
     ) {
       return yield* (yield* runner(sessionID, onInterrupt)).ensureRunning(lease(sessionID, work))
     })
