@@ -1,3 +1,5 @@
+import type { SessionV1 } from "@opencode-ai/core/v1/session"
+
 export type MarkerInput =
   | { kind: "interrupt"; intent: "steer" | "cancel" | "abort"; origin: "user" | "parent"; reason?: string }
   | { kind: "message"; peer: "parent" | "subagent"; body: string; expectReply?: boolean }
@@ -51,6 +53,12 @@ export function metadataFor(input: MarkerMetadataInput): { marker: Record<string
   if (input.kind === "interrupt") return { marker: { kind: "interrupt", intent: input.intent, origin: input.origin } }
   if (input.kind === "message") return { marker: { kind: "message", peer: input.peer, expectReply: input.expectReply } }
   return { marker: { kind: "inbox", from: input.from, ...(input.sessionId ? { sessionId: input.sessionId } : {}) } }
+}
+
+export function isMachineGeneratedUser(parts: readonly SessionV1.Part[]) {
+  return parts.every(
+    (part) => ("synthetic" in part && part.synthetic === true) || ("metadata" in part && !!part.metadata?.marker?.kind),
+  )
 }
 
 export * as Marker from "./marker"

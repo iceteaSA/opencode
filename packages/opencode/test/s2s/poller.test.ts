@@ -342,6 +342,8 @@ describe("S2SPoller: reaper cutoff advances per tick (FIX 1 regression guard)", 
       // processed → Session/SessionStatus/SessionPrompt stubs never invoked.
       localSet: () => Effect.succeed([]),
       isLocal: () => Effect.succeed(false),
+      localMessageID: () => Effect.die("unexpected Messaging.localMessageID in reaper test"),
+      isLocalFor: () => Effect.die("unexpected Messaging.isLocalFor in reaper test"),
       registerLocal: () => Effect.void,
       registerWakeHandler: () => Effect.die("unexpected Messaging.registerWakeHandler in reaper test"),
       setWakePolicy: () => Effect.die("unexpected Messaging.setWakePolicy in reaper test"),
@@ -455,6 +457,84 @@ describe("S2SPoller: reaper cutoff advances per tick (FIX 1 regression guard)", 
 })
 
 describe("S2SPoller: per-process wake loop (Task 5)", () => {
+  it.instance("does not claim pending mail after a newer human turn in another process", () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfgFor)
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const messaging = yield* Messaging.Service
+      const store = yield* S2SStore.Service
+      const poller = yield* S2SPoller.Service
+      const chat = yield* sessions.create({ title: "moved session" })
+      const first = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "first" }],
+      })
+      yield* messaging.registerLocal(chat.id, first.info.id)
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "second" }],
+      })
+      yield* store.insertInbox({
+        id: "inb_moved_session",
+        targetSessionID: chat.id,
+        fromSessionID: SessionID.make("ses_peer_moved_session_xxxxx"),
+        fromSlug: "peer",
+        capsule: capsule("MOVE-PAYLOAD"),
+        timeCreated: Date.now(),
+      })
+      yield* llm.text("reply if claimed")
+
+      yield* poller.pollOnce()
+
+      expect(yield* store.countUndelivered(chat.id)).toBe(1)
+      expect(yield* messaging.localSet()).not.toContain(chat.id)
+      expect(yield* messaging.drain(chat.id)).toEqual([])
+    }),
+  )
+
+  it.instance("does not evict after newer machine-injected turns", () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfgFor)
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const messaging = yield* Messaging.Service
+      const store = yield* S2SStore.Service
+      const poller = yield* S2SPoller.Service
+      const chat = yield* sessions.create({ title: "injected session" })
+      const first = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "first" }],
+      })
+      yield* messaging.registerLocal(chat.id, first.info.id)
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "machine", synthetic: true }],
+      })
+      yield* store.insertInbox({
+        id: "inb_injected_session",
+        targetSessionID: chat.id,
+        fromSessionID: SessionID.make("ses_peer_injected_session_xx"),
+        fromSlug: "peer",
+        capsule: capsule("INJECTED-PAYLOAD"),
+        timeCreated: Date.now(),
+      })
+      yield* llm.text("reply")
+
+      yield* poller.pollOnce()
+
+      expect(yield* store.countUndelivered(chat.id)).toBe(0)
+      expect(yield* messaging.localSet()).toContain(chat.id)
+    }),
+  )
   it.instance(
     "pollOnce claims a row for a local idle session, enqueues to inbox, wakes via prompt.loop, ✉ marker surfaces",
     () =>
