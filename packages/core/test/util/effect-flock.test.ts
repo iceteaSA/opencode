@@ -120,6 +120,39 @@ describe("util.effect-flock", () => {
   const it = testEffect(testLayer)
 
   it.live(
+    "refreshes held lease and regular lock heartbeats across their interval",
+    Effect.gen(function* () {
+      const flock = yield* EffectFlock.Service
+      const tmp = yield* Effect.promise(() => fs.mkdtemp(path.join(os.tmpdir(), "eflock-heartbeat-")))
+      yield* Effect.addFinalizer(() => Effect.promise(() => fs.rm(tmp, { recursive: true, force: true })))
+      const dir = path.join(tmp, "locks")
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const lease = yield* flock.tryAcquire("lease", dir)
+          expect(lease._tag).toBe("Some")
+          yield* flock.acquire("regular", dir)
+          const old = new Date(Date.now() - 120_000)
+          yield* Effect.promise(async () => {
+            for (const key of ["lease", "regular"]) {
+              const target = lock(dir, key)
+              await fs.utimes(path.join(target, "heartbeat"), old, old)
+              await fs.utimes(path.join(target, "meta.json"), old, old)
+              await fs.utimes(target, old, old)
+            }
+          })
+          yield* Effect.sleep("21 seconds")
+          for (const key of ["lease", "regular"]) {
+            const mtime = yield* Effect.promise(() => fs.stat(path.join(lock(dir, key), "heartbeat")))
+            expect(Date.now() - mtime.mtimeMs).toBeLessThan(5_000)
+            expect((yield* flock.tryAcquire(key, dir))._tag).toBe("None")
+          }
+        }),
+      )
+    }),
+    35_000,
+  )
+
+  it.live(
     "tryAcquire exposes ownership and preserves a takeover",
     Effect.gen(function* () {
       const flock = yield* EffectFlock.Service
