@@ -1,7 +1,7 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Deferred, Duration, Effect, Layer, Schema, Context, Option } from "effect"
 import { InstanceState } from "@/effect/instance-state"
-import { SessionID } from "@/session/schema"
+import { MessageID, SessionID } from "@/session/schema"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { MessagingEvent } from "@opencode-ai/schema/messaging-event"
 
@@ -15,7 +15,10 @@ export const INBOX_OUTBOUND_BUDGET = 20
 export const INBOX_CAP = 50
 export const DEDUP_WINDOW = 100
 export const TREE_MESSAGE_CAP = 2000
+export const S2S_HOURLY_OUTBOUND_CAP = 50
 
+export const PeerSent = MessagingEvent.PeerSent
+export const S2sDelivered = MessagingEvent.S2sDelivered
 export class RejectedError extends Schema.TaggedErrorClass<RejectedError>()("Messaging.RejectedError", {}) {
   override get message() {
     return "The parent agent is no longer available to reply"
@@ -53,8 +56,18 @@ interface ChildCounters {
 export interface InboxItem {
   from: SessionID
   fromSlug: string
+  // Human-readable sender session name (title) for s2s items; absent for
+  // coordinator-messaging (which displays the parent-owned slug instead).
+  fromName?: string
   body: string
   time: number
+  // Set by the cross-session poller when this item originated in another
+  // process (read from the s2s_inbox table, not pushed in-process). Absent
+  // for items enqueued by a tool/model running in this same process.
+  // The runLoop's drain branch (Task 6) reads this to decide whether to
+  // render the inbox message with the <external-context> framing or with
+  // the lighter in-process marker.
+  source?: "sibling-session"
 }
 
 interface State {
@@ -67,6 +80,9 @@ interface State {
   outbound: Map<SessionID, number>
   waiters: Map<SessionID, Deferred.Deferred<void>>
   treeTotal: { count: number }
+  // Message IDs fence ownership after the person continues in another process.
+  // Entries without one preserve registrations made outside SessionPrompt.loop.
+  local: Map<SessionID, MessageID | undefined>
 }
 
 export interface Interface {
@@ -94,13 +110,17 @@ export interface Interface {
     target: SessionID
     from: SessionID
     fromSlug: string
+    fromName?: string
     body: string
-  }) => Effect.Effect<void, AbuseError | NotFoundError>
+    source?: "sibling-session"
+  }) => Effect.Effect<void, AbuseError>
   readonly drain: (sessionID: SessionID) => Effect.Effect<ReadonlyArray<InboxItem>>
-  readonly awaitInbox: (
-    sessionID: SessionID,
-    opts: { timeoutMs: number },
-  ) => Effect.Effect<boolean>
+  readonly awaitInbox: (sessionID: SessionID, opts: { timeoutMs: number }) => Effect.Effect<boolean>
+  readonly registerLocal: (sessionID: SessionID, messageID?: MessageID) => Effect.Effect<void>
+  readonly isLocal: (sessionID: SessionID) => Effect.Effect<boolean>
+  readonly localMessageID: (sessionID: SessionID) => Effect.Effect<MessageID | undefined>
+  readonly isLocalFor: (sessionID: SessionID, latestHumanID: MessageID) => Effect.Effect<boolean>
+  readonly localSet: () => Effect.Effect<ReadonlyArray<SessionID>>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Messaging") {}
@@ -121,6 +141,7 @@ export const layer = Layer.effect(
           outbound: new Map<SessionID, number>(),
           waiters: new Map<SessionID, Deferred.Deferred<void>>(),
           treeTotal: { count: 0 },
+          local: new Map<SessionID, MessageID | undefined>(),
         }
         yield* Effect.addFinalizer(() =>
           Effect.gen(function* () {
@@ -136,6 +157,7 @@ export const layer = Layer.effect(
             state.outbound.clear()
             state.waiters.clear()
             state.treeTotal.count = 0
+            state.local.clear()
           }),
         )
         return state
@@ -178,7 +200,8 @@ export const layer = Layer.effect(
       const release = Effect.sync(() => {
         value.pending.delete(input.childSessionID)
         const current = value.counters.get(input.childSessionID)
-        if (current) value.counters.set(input.childSessionID, { ...current, inFlight: Math.max(0, current.inFlight - 1) })
+        if (current)
+          value.counters.set(input.childSessionID, { ...current, inFlight: Math.max(0, current.inFlight - 1) })
       })
 
       // expect_reply path: the publish must run INSIDE the protected block so
@@ -201,9 +224,7 @@ export const layer = Layer.effect(
           })
 
           yield* input.deliver
-          const result = yield* Deferred.await(deferred).pipe(
-            Effect.timeoutOption(input.timeout ?? DEFAULT_TIMEOUT),
-          )
+          const result = yield* Deferred.await(deferred).pipe(Effect.timeoutOption(input.timeout ?? DEFAULT_TIMEOUT))
           if (Option.isNone(result)) return yield* new ReplyTimeoutError({ childSessionID: input.childSessionID })
           return Option.some(result.value)
         }),
@@ -276,19 +297,47 @@ export const layer = Layer.effect(
       if (v.treeTotal.count >= TREE_MESSAGE_CAP)
         return yield* new AbuseError({ detail: "task-tree message cap reached; coordinators must synthesize and end" })
       const used = v.outbound.get(input.from) ?? 0
-      if (used >= INBOX_OUTBOUND_BUDGET)
+      // S2S has its own hourly sender cap and durable recipient inbox cap;
+      // this budget is specifically for spawned-subagent abuse and must not
+      // add a second, process-local limit to consented peer traffic.
+      if (input.source !== "sibling-session" && used >= INBOX_OUTBOUND_BUDGET)
         return yield* new AbuseError({ detail: `per-agent outbound budget (${INBOX_OUTBOUND_BUDGET}) reached` })
-      const queue = v.inbox.get(input.target)
-      if (queue === undefined) return yield* new NotFoundError({ childSessionID: input.target })
+      // Lazily init the recipient queue. The inbox no longer depends on a prior
+      // registerSlug/registerLocal having pre-created it — s2s addresses peers
+      // by session_id and never registers a slug, and the coordinator-messaging
+      // path already gates on getAllow+resolveSlug before reaching here.
+      const queue = v.inbox.get(input.target) ?? []
       const hash = `${String(input.from)}\u0000${input.body}`
       const seen = v.dedup.get(input.target) ?? []
       if (seen.includes(hash)) return
       if (queue.length >= INBOX_CAP)
         return yield* new AbuseError({ detail: `recipient inbox cap (${INBOX_CAP}) reached` })
-      queue.push({ from: input.from, fromSlug: input.fromSlug, body: input.body, time: Date.now() })
+      queue.push({
+        from: input.from,
+        fromSlug: input.fromSlug,
+        fromName: input.fromName,
+        body: input.body,
+        time: Date.now(),
+        source: input.source,
+      })
+      v.inbox.set(input.target, queue)
       v.outbound.set(input.from, used + 1)
       v.treeTotal.count++
       v.dedup.set(input.target, [...seen, hash].slice(-DEDUP_WINDOW))
+      if (input.source === "sibling-session")
+        yield* events.publish(S2sDelivered, {
+          target: input.target,
+          from: input.from,
+          fromName: input.fromName,
+          body: input.body,
+        })
+      else
+        yield* events.publish(PeerSent, {
+          from: input.from,
+          target: input.target,
+          fromSlug: input.fromSlug,
+          body: input.body,
+        })
       const w = v.waiters.get(input.target)
       if (w) {
         v.waiters.delete(input.target)
@@ -303,10 +352,7 @@ export const layer = Layer.effect(
       return q
     })
 
-    const awaitInbox: Interface["awaitInbox"] = Effect.fn("Messaging.awaitInbox")(function* (
-      sessionID,
-      opts,
-    ) {
+    const awaitInbox: Interface["awaitInbox"] = Effect.fn("Messaging.awaitInbox")(function* (sessionID, opts) {
       // Bounded behaviors (Phase 1):
       //   (i) Lost-wakeup window: the empty-check at line 1 and the waiter
       //       registration at line 2 are not atomic. A concurrent `enqueue` that
@@ -332,6 +378,37 @@ export const layer = Layer.effect(
       return Option.isSome(woke)
     })
 
+    const registerLocal: Interface["registerLocal"] = Effect.fn("Messaging.registerLocal")(
+      function* (sessionID, messageID) {
+        const v = yield* InstanceState.get(state)
+        v.local.set(sessionID, messageID)
+      },
+    )
+
+    const isLocal: Interface["isLocal"] = Effect.fn("Messaging.isLocal")(function* (sessionID) {
+      const v = yield* InstanceState.get(state)
+      return v.local.has(sessionID)
+    })
+
+    const localMessageID: Interface["localMessageID"] = Effect.fn("Messaging.localMessageID")(function* (sessionID) {
+      const v = yield* InstanceState.get(state)
+      return v.local.get(sessionID)
+    })
+
+    const isLocalFor: Interface["isLocalFor"] = Effect.fn("Messaging.isLocalFor")(function* (sessionID, latestHumanID) {
+      const v = yield* InstanceState.get(state)
+      if (!v.local.has(sessionID)) return false
+      const recorded = v.local.get(sessionID)
+      if (recorded === undefined || recorded === latestHumanID) return true
+      v.local.delete(sessionID)
+      return false
+    })
+
+    const localSet: Interface["localSet"] = Effect.fn("Messaging.localSet")(function* () {
+      const v = yield* InstanceState.get(state)
+      return [...v.local.keys()]
+    })
+
     return Service.of({
       send,
       reply,
@@ -345,12 +422,16 @@ export const layer = Layer.effect(
       enqueue,
       drain,
       awaitInbox,
+      registerLocal,
+      isLocal,
+      localMessageID,
+      isLocalFor,
+      localSet,
     })
   }),
 )
 
 export const node = LayerNode.make({ service: Service, layer, deps: [EventV2Bridge.node] })
-
 export const defaultLayer = layer
 
 export * as Messaging from "."
