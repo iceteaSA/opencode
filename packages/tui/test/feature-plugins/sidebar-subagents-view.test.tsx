@@ -2,6 +2,7 @@
 import { expect, test } from "bun:test"
 import { testRender } from "@opentui/solid"
 import { RGBA } from "@opentui/core"
+import { createSignal } from "solid-js"
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import type { Message, Part, SessionStatus } from "@opencode-ai/sdk/v2"
 import { View } from "../../src/feature-plugins/sidebar/subagents"
@@ -17,7 +18,10 @@ function fakeApi(opts: {
   childParts: (messageID: string) => ReadonlyArray<Part>
   childMessages: (sessionID: string) => ReadonlyArray<Message>
   childStatuses: (sessionID: string) => SessionStatus | undefined
+  values?: Map<string, boolean>
 }): TuiPluginApi {
+  const values = opts.values ?? new Map<string, boolean>()
+  const [revision, setRevision] = createSignal(0)
   return {
     state: {
       session: {
@@ -45,7 +49,14 @@ function fakeApi(opts: {
       register: () => () => {},
       current: { name: "session", params: {} },
     },
-    kv: { get: () => undefined, set: () => {}, ready: true },
+    kv: {
+      get: (key: string, fallback: boolean) => (revision(), values.get(key) ?? fallback),
+      set: (key: string, value: boolean) => {
+        values.set(key, value)
+        setRevision(revision() + 1)
+      },
+      ready: true,
+    },
   } as unknown as TuiPluginApi
 }
 
@@ -110,7 +121,9 @@ test("active section toggles collapse with more than one row", async () => {
     ],
   ])
 
-  const app = await testRender(() => <View api={apiForSubagents(parentMessages, parts)} session_id="parent" />, {
+  // Build the API once: a prop expression is re-evaluated on every read, which would hand the view a fresh KV.
+  const api = apiForSubagents(parentMessages, parts)
+  const app = await testRender(() => <View api={api} session_id="parent" />, {
     width: 60,
     height: 12,
   })
@@ -141,6 +154,118 @@ test("active section toggles collapse with more than one row", async () => {
     expect(frame).toContain("▼")
   } finally {
     app.renderer.destroy()
+  }
+})
+
+test("active collapse survives remount through session KV", async () => {
+  const parentMessages = [{ id: "assistant-1", role: "assistant" } as unknown as Message]
+  const parts = new Map<string, Part[]>([
+    [
+      "assistant-1",
+      ["one", "two"].map(
+        (description) =>
+          ({
+            type: "tool",
+            tool: "task",
+            state: {
+              status: "running",
+              input: { description },
+              metadata: { sessionId: description },
+              time: { start: 0 },
+            },
+          }) as unknown as Part,
+      ),
+    ],
+  ])
+  const values = new Map<string, boolean>()
+  const render = () =>
+    testRender(
+      () => (
+        <View
+          api={fakeApi({
+            parentMessages,
+            parentParts: (id) => parts.get(id) ?? [],
+            childParts: () => [],
+            childMessages: () => [],
+            childStatuses: () => busy,
+            values,
+          })}
+          session_id="parent"
+        />
+      ),
+      { width: 60, height: 12 },
+    )
+  const app = await render()
+  await renderOnceSettled(app)
+  await app.mockMouse.click(2, 0)
+  await renderOnceSettled(app)
+  expect(values.get("sidebar:subagents:open")).toBe(false)
+  app.renderer.destroy()
+
+  const remounted = await render()
+  try {
+    await renderOnceSettled(remounted)
+    const frame = await captureSettledFrame(remounted)
+    expect(frame).toContain("Subagents (2)")
+    expect(frame).not.toContain("one")
+  } finally {
+    remounted.renderer.destroy()
+  }
+})
+
+test("recent collapse survives remount through session KV", async () => {
+  const parentMessages = [{ id: "assistant-1", role: "assistant" } as unknown as Message]
+  const parts = new Map<string, Part[]>([
+    [
+      "assistant-1",
+      ["one", "two", "three"].map(
+        (description, i) =>
+          ({
+            type: "tool",
+            tool: "task",
+            state: {
+              status: "completed",
+              input: { description },
+              title: description,
+              output: "",
+              metadata: { sessionId: description },
+              time: { start: i, end: i + 1 },
+            },
+          }) as unknown as Part,
+      ),
+    ],
+  ])
+  const values = new Map<string, boolean>()
+  const render = () =>
+    testRender(
+      () => (
+        <View
+          api={fakeApi({
+            parentMessages,
+            parentParts: (id) => parts.get(id) ?? [],
+            childParts: () => [],
+            childMessages: () => [],
+            childStatuses: () => undefined,
+            values,
+          })}
+          session_id="parent"
+        />
+      ),
+      { width: 60, height: 12 },
+    )
+  const app = await render()
+  await renderOnceSettled(app)
+  await app.mockMouse.click(2, 0)
+  await renderOnceSettled(app)
+  expect(values.get("sidebar:subagents:recent:open")).toBe(false)
+  app.renderer.destroy()
+
+  const remounted = await render()
+  try {
+    await renderOnceSettled(remounted)
+    expect(await captureSettledFrame(remounted)).toContain("Recent subagents (3)")
+  } finally {
+    remounted.renderer.destroy()
   }
 })
 
