@@ -3443,6 +3443,7 @@ it.instance("loop injects a synthetic steer frame and continues the run", () =>
         ),
     )
     expect(steeredVisible).toBe(true)
+    expect((JSON.stringify(yield* llm.inputs).match(/USE_THE_CONFIG_FILE/g) ?? []).length).toBe(1)
     // A steer must NOT mark the session as terminal-aborted.
     expect(Option.isNone(yield* interrupt.terminal(chat.id))).toBe(true)
   }),
@@ -3500,6 +3501,7 @@ it.instance("loop injects a synthetic cancel frame and records a terminal reason
         ),
     )
     expect(cancelledVisible).toBe(true)
+    expect((JSON.stringify(yield* llm.inputs).match(/STOP_REASON_X/g) ?? []).length).toBe(1)
 
     const terminal = yield* interrupt.terminal(chat.id)
     expect(Option.isSome(terminal)).toBe(true)

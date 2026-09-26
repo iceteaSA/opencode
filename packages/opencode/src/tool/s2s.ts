@@ -89,6 +89,7 @@ type Metadata = {
   command: string
   target?: string
   peers?: Peer[]
+  allowance?: ReturnType<typeof outboundAllowance>
 }
 
 export const S2STool = Tool.define<typeof Parameters, Metadata, Messaging.Service | Session.Service | S2SStore.Service>(
@@ -201,12 +202,13 @@ export const S2STool = Tool.define<typeof Parameters, Metadata, Messaging.Servic
                 fromName: me.title,
                 body: params.body,
                 source: "sibling-session",
+                sent: Date.now(),
               })
               .pipe(Effect.catchTag("Messaging.AbuseError", (e) => Effect.fail(new Error(e.detail))))
             return {
               title: `Sent to ${params.target}`,
-              metadata: { command: "msg", target: params.target },
-              output: "Queued in recipient's inbox (same process).",
+              metadata: { command: "msg", target: params.target, allowance: outboundAllowance(ctx.sessionID) },
+              output: `Queued in recipient's inbox (same process; does not count toward the cross-process allowance). ${allowanceText(ctx.sessionID)}`,
             }
           }
 
@@ -227,14 +229,14 @@ export const S2STool = Tool.define<typeof Parameters, Metadata, Messaging.Servic
           if (outcome._tag === "duplicate") {
             return {
               title: `Already sent to ${params.target}`,
-              metadata: { command: "msg", target: params.target },
-              output: `Already sent within the last ${DEDUPE_WINDOW_MS / 60_000} minutes (id=${outcome.originalInboxId}); not re-queued.`,
+              metadata: { command: "msg", target: params.target, allowance: outboundAllowance(ctx.sessionID) },
+              output: `Already sent within the last ${DEDUPE_WINDOW_MS / 60_000} minutes (id=${outcome.originalInboxId}); not re-queued. ${allowanceText(ctx.sessionID)}`,
             }
           }
           return {
             title: `Sent to ${params.target}`,
-            metadata: { command: "msg", target: params.target },
-            output: `Persisted to s2s_inbox (id=${capsule.id}); recipient process will poll and wake.`,
+            metadata: { command: "msg", target: params.target, allowance: outboundAllowance(ctx.sessionID) },
+            output: `Persisted to s2s_inbox (id=${capsule.id}); recipient process will poll and wake. ${allowanceText(ctx.sessionID)}`,
           }
         }
 
@@ -349,6 +351,23 @@ export const S2STool = Tool.define<typeof Parameters, Metadata, Messaging.Servic
 // consume budget. Does NOT touch TREE_MESSAGE_CAP.
 const enqueueExternalBumpOutbound = new Map<SessionID, { hour: number; count: number }>()
 
+function outboundAllowance(sender: SessionID) {
+  const hour = Math.floor(Date.now() / 3_600_000)
+  const current = enqueueExternalBumpOutbound.get(sender)
+  const used = current?.hour === hour ? current.count : 0
+  return {
+    used,
+    limit: S2S_HOURLY_OUTBOUND_CAP,
+    remaining: S2S_HOURLY_OUTBOUND_CAP - used,
+    resets_at: new Date((hour + 1) * 3_600_000).toISOString(),
+  }
+}
+
+function allowanceText(sender: SessionID) {
+  const value = outboundAllowance(sender)
+  return `Cross-process sends this UTC clock hour: ${value.used}/${value.limit} used, ${value.remaining} remaining; resets at ${value.resets_at}.`
+}
+
 // Global cap on sender entries per Map to prevent unbounded growth
 // over process lifetime. When a Map exceeds this limit, the oldest
 // (first-inserted) sender entry is evicted before the new write.
@@ -399,7 +418,7 @@ const enqueueExternal = Effect.fn("S2STool.enqueueExternal")(function* (input: {
   const current = existing && existing.hour === hour ? existing : { hour, count: 0 }
   if (current.count >= S2S_HOURLY_OUTBOUND_CAP)
     return yield* new AbuseError({
-      detail: `s2s hourly outbound cap (${S2S_HOURLY_OUTBOUND_CAP}) reached for this session`,
+      detail: `s2s outbound cap (${S2S_HOURLY_OUTBOUND_CAP}) reached for this session in the UTC clock hour; resets at ${outboundAllowance(sender).resets_at}`,
     })
   // Durable insert-time dedupe: one transaction covers the dedup check,
   // the inbox-cap check, the s2s_inbox insert, and the s2s_sent record.

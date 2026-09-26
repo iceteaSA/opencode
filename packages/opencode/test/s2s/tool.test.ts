@@ -366,6 +366,17 @@ describe("S2STool", () => {
       const def = yield* tool.init()
       const result = yield* def.execute({ command: "msg", target: target.id, body: "ping" }, ctxFor(inviter.id))
       expect(result.output).toContain("Persisted to s2s_inbox")
+      expect(result.metadata.allowance).toEqual({
+        used: 1,
+        limit: 50,
+        remaining: 49,
+        resets_at: new Date((Math.floor(Date.now() / 3_600_000) + 1) * 3_600_000).toISOString(),
+      })
+      expect(result.output).toContain("1/50 used, 49 remaining")
+      expect(result.output).toContain("UTC clock hour")
+      const duplicate = yield* def.execute({ command: "msg", target: target.id, body: "ping" }, ctxFor(inviter.id))
+      expect(duplicate.metadata.allowance).toEqual(result.metadata.allowance)
+      expect(duplicate.output).toContain("1/50 used, 49 remaining")
       // The row is there.
       const rows = yield* store.claimForSessions([target.id])
       expect(rows).toHaveLength(1)
@@ -426,6 +437,42 @@ describe("S2STool", () => {
       expect(yield* store.countUndelivered(target.id)).toBe(1)
       expect(yield* messaging.drain(target.id)).toEqual([])
       expect(yield* messaging.localSet()).not.toContain(target.id)
+    }),
+  )
+
+  it.instance("msg to a same-process peer says it does not use the cross-process allowance", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const messaging = yield* Messaging.Service
+      const store = yield* S2SStore.Service
+      const sender = yield* seedSession("sender-local")
+      const target = yield* seedSession("target-local")
+      const first = MessageID.ascending()
+      yield* sessions.updateMessage({
+        id: first,
+        sessionID: target.id,
+        role: "user",
+        agent: "build",
+        model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test") },
+        time: { created: Date.now() },
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: first,
+        sessionID: target.id,
+        type: "text",
+        text: "first",
+      })
+      yield* messaging.registerLocal(target.id, first)
+      yield* store.insertAllow(sender.id, target.id)
+      const tool = yield* S2STool
+      const def = yield* tool.init()
+
+      const result = yield* def.execute({ command: "msg", target: target.id, body: "local" }, ctxFor(sender.id))
+
+      expect(result.output).toContain("same process; does not count toward the cross-process allowance")
+      expect(result.output).toContain("Cross-process sends this UTC clock hour: 0/50 used")
+      expect(yield* store.countUndelivered(target.id)).toBe(0)
     }),
   )
 

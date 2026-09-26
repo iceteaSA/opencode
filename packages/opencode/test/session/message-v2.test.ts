@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { APICallError } from "ai"
 import { MessageV2 } from "../../src/session/message-v2"
+import { Marker } from "../../src/session/marker"
 import { ProviderTransform } from "@/provider/transform"
 import type { Provider } from "@/provider/provider"
 
@@ -163,6 +164,59 @@ function assistantReasoningInput(
 }
 
 describe("session.message-v2.toModelMessage", () => {
+  test("subagent message marker stays stored but only its synthetic frame reaches the model", async () => {
+    const id = "msg_subagent-message"
+    const input: SessionV1.WithParts[] = [
+      {
+        info: userInfo(id),
+        parts: [
+          {
+            ...basePart(id, "message-frame"),
+            type: "text",
+            synthetic: true,
+            text: '<agent_message from="child">subagent-body</agent_message>',
+          },
+          {
+            ...basePart(id, "message-marker"),
+            type: "text",
+            text: Marker.render({ kind: "message", peer: "subagent", body: "subagent-body" }),
+            metadata: Marker.metadataFor({ kind: "message", peer: "subagent" }),
+          },
+        ],
+      },
+    ]
+    expect(input[0]?.parts).toHaveLength(2)
+    expect(input[0]?.parts[1]).toMatchObject({ metadata: { marker: { kind: "message" } } })
+    const messages = await MessageV2.toModelMessages(input, model)
+    expect((JSON.stringify(messages).match(/subagent-body/g) ?? []).length).toBe(1)
+  })
+
+  test("standalone reply and abort markers remain model-visible when no frame accompanies them", async () => {
+    const id = "msg_standalone-markers"
+    const input: SessionV1.WithParts[] = [
+      {
+        info: userInfo(id),
+        parts: [
+          {
+            ...basePart(id, "reply-marker"),
+            type: "text",
+            text: Marker.render({ kind: "message", peer: "parent", body: "reply-body" }),
+            metadata: Marker.metadataFor({ kind: "message", peer: "parent" }),
+          },
+          {
+            ...basePart(id, "abort-marker"),
+            type: "text",
+            text: Marker.render({ kind: "interrupt", intent: "abort", origin: "parent", reason: "abort-body" }),
+            metadata: Marker.metadataFor({ kind: "interrupt", intent: "abort", origin: "parent" }),
+          },
+        ],
+      },
+    ]
+    const messages = await MessageV2.toModelMessages(input, model)
+    expect((JSON.stringify(messages).match(/reply-body/g) ?? []).length).toBe(1)
+    expect((JSON.stringify(messages).match(/abort-body/g) ?? []).length).toBe(1)
+  })
+
   test("drops a truncated assistant message left with only empty text", async () => {
     const result = await MessageV2.toModelMessages(assistantReasoningInput("length", undefined, ""), model)
 
