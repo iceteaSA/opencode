@@ -187,10 +187,21 @@ async function builtinSidebarFrame(sections?: { order?: string[]; hidden?: strin
       lsp: () => [],
       session: {
         ...api.state.session,
-        messages: () => [],
+        messages: (sessionID: string) => (sessionID === "one" ? [{ id: "parent-message" }] : []),
         todo: () => [],
         diff: () => [],
+        status: (sessionID: string) => (sessionID === "child" ? { type: "busy" as const } : undefined),
       },
+      part: (messageID: string) =>
+        messageID === "parent-message"
+          ? [
+              {
+                type: "tool",
+                tool: "task",
+                state: { status: "running", input: { description: "Research" }, metadata: { sessionId: "child" } },
+              },
+            ]
+          : [],
     })
     if (collapsed) api.kv.set("sidebar:mcp:open", false)
     const slots = createSlots()
@@ -228,31 +239,55 @@ const builtinCases: {
   collapsed: boolean
   titles: string[]
 }[] = [
-  { name: "default", sections: undefined, collapsed: false, titles: ["Context", "MCP", "LSP", "CLAUDE"] },
-  { name: "hidden context", sections: { hidden: ["context"] }, collapsed: false, titles: ["MCP", "LSP", "CLAUDE"] },
+  { name: "default", sections: undefined, collapsed: false, titles: ["Context", "MCP", "LSP", "Subagents", "CLAUDE"] },
+  {
+    name: "hidden context",
+    sections: { hidden: ["context"] },
+    collapsed: false,
+    titles: ["MCP", "LSP", "Subagents", "CLAUDE"],
+  },
   {
     name: "hidden context and lsp",
     sections: { hidden: ["context", "lsp"] },
     collapsed: false,
-    titles: ["MCP", "CLAUDE"],
+    titles: ["MCP", "Subagents", "CLAUDE"],
   },
-  { name: "ordered mcp", sections: { order: ["mcp"] }, collapsed: false, titles: ["MCP", "Context", "LSP", "CLAUDE"] },
+  {
+    name: "ordered mcp",
+    sections: { order: ["mcp"] },
+    collapsed: false,
+    titles: ["MCP", "Context", "LSP", "Subagents", "CLAUDE"],
+  },
+  {
+    name: "ordered subagents between context and mcp",
+    sections: { order: ["context", "subagents"] },
+    collapsed: false,
+    titles: ["Context", "Subagents", "MCP", "LSP", "CLAUDE"],
+  },
+  {
+    name: "hidden subagents",
+    sections: { hidden: ["subagents"] },
+    collapsed: false,
+    titles: ["Context", "MCP", "LSP", "CLAUDE"],
+  },
   {
     name: "hidden context with collapsed mcp",
     sections: { hidden: ["context"] },
     collapsed: true,
-    titles: ["MCP", "LSP", "CLAUDE"],
+    titles: ["MCP", "LSP", "Subagents", "CLAUDE"],
   },
   {
     name: "hidden context and lsp with collapsed mcp",
     sections: { hidden: ["context", "lsp"] },
     collapsed: true,
-    titles: ["MCP", "CLAUDE"],
+    titles: ["MCP", "Subagents", "CLAUDE"],
   },
 ]
 
 test.each(builtinCases)("real built-in sidebar sections: $name", async ({ sections, collapsed, titles }) => {
   const frame = await builtinSidebarFrame(sections, collapsed)
-  expect(frame.split("\n").flatMap((line) => line.match(/\b(Context|MCP|LSP|CLAUDE)\b/)?.[0] ?? [])).toEqual(titles)
+  expect(frame.split("\n").flatMap((line) => line.match(/\b(Context|MCP|LSP|Subagents|CLAUDE)\b/)?.[0] ?? [])).toEqual(
+    titles,
+  )
   expect(frame.includes("server-one")).toBe(!collapsed)
 })
