@@ -2,7 +2,7 @@ import type { Message, Part, SessionStatus, ToolPart } from "@opencode-ai/sdk/v2
 import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui"
 import type { BuiltinTuiPlugin } from "../builtins"
 import { formatTPS, getMessageTPS, type TPSResult } from "@opencode-ai/core/session/tokens"
-import { createMemo, createSignal, For, Show } from "solid-js"
+import { createMemo, For, Show } from "solid-js"
 import { Locale } from "../../util/locale"
 
 const id = "internal:sidebar-subagents"
@@ -228,8 +228,8 @@ type ActiveRow = SidebarSubagent & { activity: string | undefined }
 
 export function View(props: { api: TuiPluginApi; session_id: string }) {
   const theme = () => props.api.theme.current
-  const [historyOpen, setHistoryOpen] = createSignal(true)
-  const [activeOpen, setActiveOpen] = createSignal(true)
+  const historyOpen = () => props.api.kv.get("sidebar:subagents:recent:open", true)
+  const activeOpen = () => props.api.kv.get("sidebar:subagents:open", true)
   const list = createMemo<ActiveRow[]>(() =>
     activeSubagents(
       props.api.state.session.messages(props.session_id),
@@ -280,7 +280,11 @@ export function View(props: { api: TuiPluginApi; session_id: string }) {
       <box gap={1}>
         <Show when={list().length > 0}>
           <box>
-            <box flexDirection="row" gap={1} onMouseDown={() => list().length > 1 && setActiveOpen((x) => !x)}>
+            <box
+              flexDirection="row"
+              gap={1}
+              onMouseDown={() => list().length > 1 && props.api.kv.set("sidebar:subagents:open", !activeOpen())}
+            >
               <Show when={list().length > 1}>
                 <text fg={theme().text}>{activeOpen() ? "▼" : "▶"}</text>
               </Show>
@@ -324,7 +328,13 @@ export function View(props: { api: TuiPluginApi; session_id: string }) {
         </Show>
         <Show when={history().length > 0}>
           <box>
-            <box flexDirection="row" gap={1} onMouseDown={() => history().length > 2 && setHistoryOpen((x) => !x)}>
+            <box
+              flexDirection="row"
+              gap={1}
+              onMouseDown={() =>
+                history().length > 2 && props.api.kv.set("sidebar:subagents:recent:open", !historyOpen())
+              }
+            >
               <Show when={history().length > 2}>
                 <text fg={theme().text}>{historyOpen() ? "▼" : "▶"}</text>
               </Show>
