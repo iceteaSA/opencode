@@ -1272,6 +1272,7 @@ export const layer = Layer.effect(
                       fromName: cap.value.sender_name ?? row.fromSlug ?? "unknown",
                       body: cap.value.body,
                       source: "sibling-session",
+                      inboxId: row.id,
                     })
                     // Delivered into the in-process inbox — hard-delete the row
                     // so the 60s reaper never redelivers an already-delivered

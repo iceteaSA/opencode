@@ -7,6 +7,7 @@ import { MessagingEvent } from "@opencode-ai/schema/messaging-event"
 import { attach } from "@/effect/run-service"
 import { SessionStatus } from "@/session/status"
 import { Session } from "@/session/session"
+import { DEDUPE_WINDOW_MS } from "@/s2s/store"
 
 export const Sent = MessagingEvent.Sent
 export const Replied = MessagingEvent.Replied
@@ -71,6 +72,7 @@ export interface InboxItem {
   // render the inbox message with the <external-context> framing or with
   // the lighter in-process marker.
   source?: "sibling-session"
+  inboxId?: string
 }
 
 interface State {
@@ -79,7 +81,7 @@ interface State {
   registry: Map<string, SessionID>
   allow: Map<SessionID, string[]>
   inbox: Map<SessionID, InboxItem[]>
-  dedup: Map<SessionID, string[]>
+  dedup: Map<SessionID, { hash: string; time: number; inboxId?: string }[]>
   outbound: Map<SessionID, number>
   waiters: Map<SessionID, Deferred.Deferred<void>>
   treeTotal: { count: number }
@@ -122,6 +124,7 @@ export interface Interface {
     fromName?: string
     body: string
     source?: "sibling-session"
+    inboxId?: string
   }) => Effect.Effect<void, AbuseError>
   readonly drain: (sessionID: SessionID) => Effect.Effect<ReadonlyArray<InboxItem>>
   readonly awaitInbox: (sessionID: SessionID, opts: { timeoutMs: number }) => Effect.Effect<boolean>
@@ -156,7 +159,7 @@ export const layer = Layer.effect(
           registry: new Map<string, SessionID>(),
           allow: new Map<SessionID, string[]>(),
           inbox: new Map<SessionID, InboxItem[]>(),
-          dedup: new Map<SessionID, string[]>(),
+          dedup: new Map(),
           outbound: new Map<SessionID, number>(),
           waiters: new Map<SessionID, Deferred.Deferred<void>>(),
           treeTotal: { count: 0 },
@@ -331,8 +334,18 @@ export const layer = Layer.effect(
       // path already gates on getAllow+resolveSlug before reaching here.
       const queue = v.inbox.get(input.target) ?? []
       const hash = `${String(input.from)}\u0000${input.body}`
-      const seen = v.dedup.get(input.target) ?? []
-      if (seen.includes(hash)) return
+      const now = Date.now()
+      const seen = (v.dedup.get(input.target) ?? []).filter(
+        (entry) => entry.inboxId !== undefined || now - entry.time < DEDUPE_WINDOW_MS,
+      )
+      if (
+        seen.some(
+          (entry) =>
+            (input.inboxId && entry.inboxId === input.inboxId) ||
+            (entry.hash === hash && now - entry.time < DEDUPE_WINDOW_MS),
+        )
+      )
+        return
       if (queue.length >= INBOX_CAP)
         return yield* new AbuseError({ detail: `recipient inbox cap (${INBOX_CAP}) reached` })
       queue.push({
@@ -340,13 +353,14 @@ export const layer = Layer.effect(
         fromSlug: input.fromSlug,
         fromName: input.fromName,
         body: input.body,
-        time: Date.now(),
+        time: now,
         source: input.source,
+        inboxId: input.inboxId,
       })
       v.inbox.set(input.target, queue)
       v.outbound.set(input.from, used + 1)
       v.treeTotal.count++
-      v.dedup.set(input.target, [...seen, hash].slice(-DEDUP_WINDOW))
+      v.dedup.set(input.target, [...seen, { hash, time: now, inboxId: input.inboxId }].slice(-DEDUP_WINDOW))
       if (input.source === "sibling-session")
         yield* events.publish(S2sDelivered, {
           target: input.target,

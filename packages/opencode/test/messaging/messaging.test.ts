@@ -290,3 +290,30 @@ test("escapeBody - XML-escapes body to prevent tag breakout in rendered framing"
   // Safe text is unchanged
   expect(escapeBody("hello world")).toBe("hello world")
 })
+
+it.instance(
+  "enqueue expires body dedupe after the sender window and fences repeated inbox row ids",
+  () =>
+    Effect.gen(function* () {
+      const messaging = yield* Messaging.Service
+      const original = Date.now
+      try {
+        Date.now = () => 1_000_000
+        const input = { target: PARENT, from: CHILD, fromSlug: "child", body: "repeat" }
+        yield* messaging.enqueue(input)
+        yield* messaging.enqueue(input)
+        expect(yield* messaging.drain(PARENT)).toHaveLength(1)
+
+        Date.now = () => 1_000_000 + 600_001
+        yield* messaging.enqueue(input)
+        expect(yield* messaging.drain(PARENT)).toHaveLength(1)
+
+        yield* messaging.enqueue({ ...input, body: "row first", inboxId: "row-1", source: "sibling-session" })
+        yield* messaging.enqueue({ ...input, body: "row retry", inboxId: "row-1", source: "sibling-session" })
+        expect((yield* messaging.drain(PARENT)).map((item) => item.body)).toEqual(["row first"])
+      } finally {
+        Date.now = original
+      }
+    }),
+  { git: true },
+)
