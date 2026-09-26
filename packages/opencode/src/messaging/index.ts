@@ -65,6 +65,7 @@ export interface InboxItem {
   fromName?: string
   body: string
   time: number
+  sent?: number
   // Set by the cross-session poller when this item originated in another
   // process (read from the s2s_inbox table, not pushed in-process). Absent
   // for items enqueued by a tool/model running in this same process.
@@ -125,6 +126,7 @@ export interface Interface {
     body: string
     source?: "sibling-session"
     inboxId?: string
+    sent?: number
   }) => Effect.Effect<void, AbuseError>
   readonly drain: (sessionID: SessionID) => Effect.Effect<ReadonlyArray<InboxItem>>
   readonly awaitInbox: (sessionID: SessionID, opts: { timeoutMs: number }) => Effect.Effect<boolean>
@@ -354,6 +356,7 @@ export const layer = Layer.effect(
         fromName: input.fromName,
         body: input.body,
         time: now,
+        sent: input.sent,
         source: input.source,
         inboxId: input.inboxId,
       })

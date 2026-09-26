@@ -201,6 +201,7 @@ export const S2STool = Tool.define<typeof Parameters, Metadata, Messaging.Servic
                 fromName: me.title,
                 body: params.body,
                 source: "sibling-session",
+                sent: Date.now(),
               })
               .pipe(Effect.catchTag("Messaging.AbuseError", (e) => Effect.fail(new Error(e.detail))))
             return {

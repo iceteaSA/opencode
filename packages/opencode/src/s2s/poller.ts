@@ -120,6 +120,7 @@ const processRow = Effect.fn("S2SPoller.processRow")(function* (row: S2SStore.In
     body: cap.value.body,
     source: "sibling-session",
     inboxId: row.id,
+    sent: cap.value.timestamp,
   })
 
   // Delivered into the in-process inbox — hard-delete the durable row so the
