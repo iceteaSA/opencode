@@ -1272,6 +1272,8 @@ export const layer = Layer.effect(
                       fromName: cap.value.sender_name ?? row.fromSlug ?? "unknown",
                       body: cap.value.body,
                       source: "sibling-session",
+                      inboxId: row.id,
+                      sent: cap.value.timestamp,
                     })
                     // Delivered into the in-process inbox — hard-delete the row
                     // so the 60s reaper never redelivers an already-delivered
@@ -1314,7 +1316,7 @@ export const layer = Layer.effect(
                 const s2sName = item.fromName ?? item.fromSlug
                 const frameText =
                   item.source === "sibling-session"
-                    ? `<external-context source="sibling-session" name="${Marker.escapeAttr(s2sName)}" session="${Marker.escapeAttr(String(item.from))}" time="${item.time}">\n${Marker.escape(item.body)}\n</external-context>`
+                    ? `<external-context source="sibling-session" name="${Marker.escapeAttr(s2sName)}" session="${Marker.escapeAttr(String(item.from))}" time="${item.time}" sent="${Marker.escapeAttr(new Date(item.sent ?? item.time).toISOString())}">\n${Marker.escape(item.body)}\n</external-context>`
                     : `<agent_message from="${Marker.escapeAttr(item.fromSlug)}">\n${Marker.escape(item.body)}\n</agent_message>`
                 yield* sessions.updatePart({
                   id: PartID.ascending(),

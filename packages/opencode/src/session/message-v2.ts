@@ -206,6 +206,25 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
         parts: [],
       }
       for (const part of msg.parts) {
+        const marker = part.type === "text" ? part.metadata?.marker : undefined
+        // Standalone reply and abort markers have no hidden frame to carry their content.
+        if (
+          marker &&
+          msg.parts.some(
+            (candidate) =>
+              candidate.type === "text" &&
+              candidate.synthetic === true &&
+              ((marker.kind === "inbox" &&
+                (candidate.text.startsWith("<external-context ") || candidate.text.startsWith("<agent_message "))) ||
+                (marker.kind === "message" &&
+                  marker.peer === "subagent" &&
+                  candidate.text.startsWith("<agent_message ")) ||
+                (marker.kind === "interrupt" &&
+                  ((marker.intent === "steer" && candidate.text.startsWith("<steer>")) ||
+                    (marker.intent === "cancel" && candidate.text.startsWith("<cancel>"))))),
+          )
+        )
+          continue
         // User message parts should never be empty
         if (part.type === "text" && !part.ignored && part.text !== "")
           userMessage.parts.push({

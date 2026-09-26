@@ -308,6 +308,46 @@ describe("tool.task", () => {
     }),
   )
 
+  it.instance("resume restores persisted message_allow after restart and explicit empty list revokes it", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const messaging = yield* Messaging.Service
+      const { chat, assistant } = yield* seed()
+      const child = yield* sessions.create({
+        parentID: chat.id,
+        title: "Existing child",
+        metadata: { message_allow: ["sibling"] },
+      })
+      const def = yield* (yield* TaskTool).init()
+      const ctx = {
+        sessionID: chat.id,
+        messageID: assistant.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { promptOps: stubOps() },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+      const input = {
+        description: "resume",
+        prompt: "continue",
+        subagent_type: "general",
+        task_id: child.id,
+        resume: true,
+      }
+
+      expect(yield* messaging.getAllow(child.id)).toEqual([])
+      yield* def.execute(input, ctx)
+      expect(yield* messaging.getAllow(child.id)).toEqual(["sibling"])
+      expect((yield* sessions.get(child.id)).metadata?.message_allow).toEqual(["sibling"])
+
+      yield* def.execute({ ...input, message_allow: [] }, ctx)
+      expect(yield* messaging.getAllow(child.id)).toEqual([])
+      expect((yield* sessions.get(child.id)).metadata?.message_allow).toEqual([])
+    }),
+  )
+
   it.instance("execute surfaces child errors with a resumable task_id", () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
