@@ -289,9 +289,9 @@ function renderInbound(childSessionID: SessionID, body: string, expectReply: boo
 }
 
 // Build the user-visible transcript marker for a message-tool event.
-// Bodies travel into the model too (the marker is non-synthetic and non-ignored
-// so the TUI can render it without changing the visibility predicate), so the
-// untrusted body is XML-escaped with the same scheme as the synthetic frame.
+// The marker stays non-synthetic for TUI rendering; the model-message converter
+// drops it only when the accompanying synthetic frame carries the body.
+// Standalone reply markers still reach the model, so escape untrusted bodies.
 export function renderMarker(input: { peer: MessageMarkerPeer; body: string; expectReply?: boolean }) {
   return Marker.render({ kind: "message", ...input })
 }
