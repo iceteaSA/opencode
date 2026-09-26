@@ -56,6 +56,13 @@ test("decodes the optional sidebar state vocabulary", () => {
   expect(decodeInfo({}).sidebar).toBeUndefined()
 })
 
+test("accepts sidebar section names while rejecting non-string entries", () => {
+  expect(decodeInfo({ sidebar_sections: { order: ["todo", "external-plugin"], hidden: ["lsp"] } })).toEqual({
+    sidebar_sections: { order: ["todo", "external-plugin"], hidden: ["lsp"] },
+  })
+  expect(() => decodeInfo({ sidebar_sections: { order: [1] } })).toThrow()
+})
+
 test("resolves host-neutral defaults", () => {
   const config = resolve({}, { terminalSuspend: true })
 
