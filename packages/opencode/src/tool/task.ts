@@ -447,21 +447,32 @@ export const TaskTool = Tool.define(
                     ),
                 ),
               ],
-              metadata: params.metadata,
+              metadata: {
+                ...params.metadata,
+                ...(params.message_allow === undefined ? {} : { message_allow: [...params.message_allow] }),
+              },
               ...(contextMode === "sparse" ? { contextMode } : {}),
             })
           }),
         ))
 
       if (params.task_id) yield* messaging.registerSlug(params.task_id, nextSession.id)
-      yield* messaging.setAllow(nextSession.id, [...(params.message_allow ?? [])])
+      if (!session || params.message_allow !== undefined || Array.isArray(session.metadata?.message_allow))
+        yield* messaging.setAllow(nextSession.id, [
+          ...(params.message_allow ??
+            (Array.isArray(session?.metadata?.message_allow) ? session.metadata.message_allow : [])),
+        ])
       if (params.wake_on_message === true)
         yield* messaging.setWakePolicy({ sessionID: nextSession.id, budget: WAKE_BUDGET_DEFAULT })
 
-      if (session && params.metadata) {
+      if (session && (params.metadata || params.message_allow !== undefined)) {
         yield* sessions.setMetadata({
           sessionID: session.id,
-          metadata: { ...session.metadata, ...params.metadata },
+          metadata: {
+            ...session.metadata,
+            ...params.metadata,
+            ...(params.message_allow === undefined ? {} : { message_allow: [...params.message_allow] }),
+          },
         })
       }
 
