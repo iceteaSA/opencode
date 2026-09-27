@@ -38,6 +38,38 @@ describe("opencode run (non-interactive subprocess)", () => {
     60_000,
   )
 
+  cliIt.concurrent("flushes the final log before process exit", ({ home }) =>
+    Effect.gen(function* () {
+      const child = Bun.spawn([process.execPath, path.join(import.meta.dir, "../../fixture/log-flush.ts")], {
+        env: {
+          OPENCODE_TEST_HOME: home,
+          HOME: home,
+          XDG_CONFIG_HOME: path.join(home, ".config"),
+          XDG_DATA_HOME: path.join(home, ".local/share"),
+          XDG_STATE_HOME: path.join(home, ".local/state"),
+          XDG_CACHE_HOME: path.join(home, ".cache"),
+          OPENCODE_CONFIG_CONTENT: "{}",
+          OPENCODE_DISABLE_PROJECT_CONFIG: "1",
+          OPENCODE_PURE: "1",
+          OPENCODE_DISABLE_AUTOUPDATE: "1",
+          OPENCODE_DISABLE_AUTOCOMPACT: "1",
+          OPENCODE_DISABLE_MODELS_FETCH: "1",
+          OPENCODE_AUTH_CONTENT: "{}",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      })
+      const [exitCode, stderr] = yield* Effect.promise(() =>
+        Promise.all([child.exited, new Response(child.stderr).text()]),
+      )
+      expect(exitCode, stderr).toBe(0)
+      const log = yield* Effect.promise(() =>
+        Bun.file(path.join(home, ".local/share/opencode/log/opencode.log")).text(),
+      )
+      expect(log).toContain("message=flush-before-exit-marker")
+    }),
+  )
+
   cliIt.live(
     "prints a reply from another process that continued the session",
     ({ home, llm, opencode }) =>

@@ -29,6 +29,7 @@ import { DbCommand } from "./cli/cmd/db"
 import { errorMessage } from "./util/error"
 import { PluginCommand } from "./cli/cmd/plug"
 import { Heap } from "./cli/heap"
+import { CliExit, flushLogs } from "./cli/exit"
 
 const args = hideBin(process.argv)
 
@@ -111,7 +112,7 @@ const cli = yargs(args)
       cli.showHelp(show)
     }
     if (err) throw err
-    process.exit(1)
+    throw new CliExit(1)
   })
   .strict()
 
@@ -126,17 +127,22 @@ try {
     await cli.parse()
   }
 } catch (e) {
-  const formatted = FormatError(e)
-  if (formatted) UI.error(formatted)
-  if (formatted === undefined) {
-    UI.error("Unexpected error" + EOL)
-    process.stderr.write(errorMessage(e) + EOL)
+  if (e instanceof CliExit) {
+    process.exitCode = e.code
+  } else {
+    const formatted = FormatError(e)
+    if (formatted) UI.error(formatted)
+    if (formatted === undefined) {
+      UI.error("Unexpected error" + EOL)
+      process.stderr.write(errorMessage(e) + EOL)
+    }
+    process.exitCode = 1
   }
-  process.exitCode = 1
 } finally {
   // Some subprocesses don't react properly to SIGTERM and similar signals.
   // Most notably, some docker-container-based MCP servers don't handle such signals unless
   // run using `docker run --init`.
   // Explicitly exit to avoid any hanging subprocesses.
+  await flushLogs()
   process.exit()
 }
