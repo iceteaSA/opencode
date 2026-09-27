@@ -12,6 +12,7 @@ import { MessageV2 } from "@/session/message-v2"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionRevert } from "@/session/revert"
 import { SessionRunState } from "@/session/run-state"
+import { TaskOutcomes } from "@/tool/task-outcomes"
 import { SessionStatus } from "@/session/status"
 import { SessionSummary } from "@/session/summary"
 import { Interrupt } from "@/session/interrupt"
@@ -57,6 +58,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     const revertSvc = yield* SessionRevert.Service
     const compactSvc = yield* SessionCompaction.Service
     const runState = yield* SessionRunState.Service
+    const outcomes = yield* TaskOutcomes.Service
     const agentSvc = yield* Agent.Service
     const permissionSvc = yield* Permission.Service
     const statusSvc = yield* SessionStatus.Service
@@ -258,12 +260,16 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       // task_steer/task_cancel/task_abort tools already make this same
       // running-only guarantee via resolveChild in task-interrupt.ts.
       const job = yield* backgroundSvc.get(ctx.params.sessionID)
-      if (!job || job.status !== "running") return yield* new HttpApiError.BadRequest({})
+      const current = yield* outcomes.current(ctx.params.sessionID)
+      const runnerBusy = yield* runState
+        .assertNotBusy(ctx.params.sessionID)
+        .pipe(Effect.match({ onFailure: () => true, onSuccess: () => false }))
+      if (job?.status !== "running" && !(current?.active && runnerBusy)) return yield* new HttpApiError.BadRequest({})
       if (ctx.payload.intent === "abort") {
         // Abort bypasses the pending-intent slot — it writes a visible marker,
-        // records a terminal reason, and cancels the BackgroundJob immediately.
+        // records a terminal reason, and stops the active child run.
         yield* Interrupt.abortChild(
-          { sessions: session, background: backgroundSvc, interrupt: interruptSvc },
+          { sessions: session, background: backgroundSvc, interrupt: interruptSvc, runState },
           { childID: ctx.params.sessionID, origin: "user", reason: ctx.payload.reason },
         )
       } else {

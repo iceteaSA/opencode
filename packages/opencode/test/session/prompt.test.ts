@@ -58,6 +58,7 @@ import { Shell } from "@opencode-ai/core/shell"
 import { Snapshot } from "../../src/snapshot"
 import { ToolRegistry } from "@/tool/registry"
 import { TaskTool, type TaskPromptOps } from "../../src/tool/task"
+import { TaskOutcomes } from "@/tool/task-outcomes"
 import { Truncate } from "@/tool/truncate"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
@@ -211,6 +212,7 @@ const promptRoot = LayerNode.group([
   Todo.node,
   Interrupt.node,
   ToolRegistry.node,
+  TaskOutcomes.node,
   Skill.node,
   Git.node,
   Ripgrep.node,
@@ -3664,6 +3666,7 @@ backgroundNoLLMServer.instance(
       const promptOps: TaskPromptOps = {
         cancel: () => Effect.void,
         cancelRun: () => Effect.void,
+        loop: () => Effect.succeed({ info: seeded.assistant, parts: [] }),
         resolvePromptParts: () => Effect.succeed([{ type: "text", text: "child prompt" }]),
         prompt: (input) => prompt.prompt({ ...input, noReply: true }).pipe(Effect.orDie),
       }

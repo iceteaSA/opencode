@@ -9,6 +9,7 @@ import { MessageV2 } from "@/session/message-v2"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { Session } from "@/session/session"
 import type { BackgroundJob } from "@/background/job"
+import type { SessionRunState } from "@/session/run-state"
 
 // How many turns a child may keep running after a cancel frame is delivered
 // before the loop force-breaks. The model normally wraps up in 1 turn; this
@@ -140,14 +141,14 @@ export function renderMarker(input: { intent: "steer" | "cancel" | "abort"; orig
   return Marker.render({ kind: "interrupt", ...input })
 }
 
-// --- shared abort helper (writes visible marker, records terminal, cancels job) --
+// --- shared abort helper (writes visible marker, records terminal, stops child) --
 
 // Standalone helper so both the task_abort tool and the HTTP /interrupt handler
 // produce identical visible abort markers. Takes interfaces as params (no
 // service deps) so callers do not need to add a new layer. The visible marker
 // is best-effort: a child with no user message yet (should never happen for a
 // running child — its dispatch prompt is always the first user message) is NOT
-// a fatal abort error, the terminal record + background cancellation must still
+// a fatal abort error; the terminal record and targeted cancellation must still
 // complete.
 //
 // Model/agent are derived from the child's MOST RECENT USER MESSAGE (mirroring
@@ -162,7 +163,12 @@ export function renderMarker(input: { intent: "steer" | "cancel" | "abort"; orig
 // race the foreground+background readers in task.ts, so the existing reuse
 // cleanup is the simplest safe scheme.
 export const abortChild = (
-  deps: { sessions: Session.Interface; background: BackgroundJob.Interface; interrupt: Interface },
+  deps: {
+    sessions: Session.Interface
+    background: BackgroundJob.Interface
+    interrupt: Interface
+    runState: SessionRunState.Interface
+  },
   input: { childID: SessionID; origin: Origin; reason?: string },
 ) =>
   Effect.gen(function* () {
@@ -198,6 +204,8 @@ export const abortChild = (
       reason: reason ?? `Aborted by ${input.origin}`,
     })
     yield* deps.background.cancel(input.childID)
+    // The background job may already be settled while its child runs a wake; cancel only that runner, not descendant jobs.
+    yield* deps.runState.cancelRun(input.childID)
   })
 
 // --- frame renderers (untrusted reason is XML-escaped) -------------------------

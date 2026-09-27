@@ -18,12 +18,13 @@ import { SessionStatus } from "@/session/status"
 
 import { Interrupt } from "../../src/session/interrupt"
 import { TaskTool, renderOutput, Event as TaskEventDef, type TaskPromptOps, childResultBlock } from "../../src/tool/task"
+import { TaskOutcomes } from "../../src/tool/task-outcomes"
 import { TaskReturnTool } from "../../src/tool/task-return"
 import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { disposeAllInstances } from "../fixture/fixture"
-import { testEffect } from "../lib/effect"
+import { pollWithTimeout, testEffect } from "../lib/effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { Messaging } from "../../src/messaging"
@@ -42,6 +43,7 @@ const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
     LayerNode.group([
       Agent.node,
       BackgroundJob.node,
+      TaskOutcomes.node,
       EventV2Bridge.node,
       Config.node,
       CrossSpawnSpawner.node,
@@ -112,6 +114,7 @@ function stubOps(opts?: {
   return {
     cancel: () => Effect.void,
     cancelRun: () => Effect.void,
+    loop: (sessionID) => Effect.succeed(reply({ sessionID, parts: [] }, "done")),
     resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
     prompt: (input) =>
       Effect.sync(() => {
@@ -690,6 +693,7 @@ describe("tool.task", () => {
             cancelled.resolve(sessionID)
           }),
         cancelRun: () => Effect.void,
+        loop: (sessionID) => Effect.succeed(reply({ sessionID, parts: [] }, "done")),
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
         prompt: (input) =>
           Effect.promise(() => {
@@ -1490,6 +1494,7 @@ describe("tool.task", () => {
       const promptOps: TaskPromptOps = {
         cancel: () => Effect.void,
         cancelRun: () => Effect.void,
+        loop: (sessionID) => Effect.succeed(reply({ sessionID, parts: [] }, "done")),
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
         prompt: (input) => {
           if (input.sessionID === chat.id) {
@@ -1541,6 +1546,162 @@ describe("tool.task", () => {
       expect((yield* jobs.wait({ id: result.metadata.sessionId })).info?.output).toBe("background done")
       expect((yield* Deferred.await(injected)).parts[0]?.type).toBe("text")
       expect(runs).toBe(1)
+    }),
+  )
+
+  background.instance("a promoted foreground settlement notifies once when it wins the race", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const firstWait = yield* Deferred.make<void>()
+      const releaseNotifier = yield* Deferred.make<void>()
+      const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
+      const calls: SessionPrompt.PromptInput[] = []
+      const waits = { count: 0 }
+      const fakeBackground: BackgroundJob.Interface = {
+        list: () => Effect.succeed([]),
+        get: () => Effect.succeed(undefined),
+        start: (input) =>
+          Effect.gen(function* () {
+            if (!input.onPromote) throw new Error("promotion callback missing")
+            yield* input.onPromote
+            yield* Deferred.await(firstWait)
+            return {
+              id: input.id ?? "task",
+              type: input.type,
+              title: input.title,
+              status: "running" as const,
+              started_at: 0,
+              metadata: input.metadata,
+            }
+          }),
+        extend: () => Effect.succeed(false),
+        wait: () =>
+          Effect.gen(function* () {
+            waits.count++
+            if (waits.count === 1) {
+              yield* Deferred.succeed(firstWait, undefined)
+              yield* Deferred.await(releaseNotifier)
+            }
+            return {
+              timedOut: false,
+              info: { id: "task", type: "task", status: "completed" as const, started_at: 0, output: "promoted done" },
+            }
+          }),
+        waitForPromotion: () => Effect.never,
+        message: () => Effect.succeed(undefined),
+        waitForMessage: () => Effect.never,
+        promote: () => Effect.succeed(undefined),
+        cancel: () => Effect.succeed(undefined),
+      }
+      const task = yield* TaskTool.pipe(Effect.provideService(BackgroundJob.Service, fakeBackground))
+      const result = yield* (yield* task.init()).execute(
+        { description: "inspect bug", prompt: "look into the cache key path", subagent_type: "general" },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: {
+            promptOps: {
+              ...stubOps({ text: "promoted done" }),
+              prompt: (input) =>
+                input.sessionID === chat.id
+                  ? Effect.sync(() => {
+                      calls.push(input)
+                      return reply(input, "injected")
+                    }).pipe(Effect.tap(() => Deferred.succeed(injected, input)))
+                  : Effect.succeed(reply(input, "promoted done")),
+            } satisfies TaskPromptOps,
+          },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+      expect(result.output).toContain('state="completed"')
+      expect(waits.count).toBe(2)
+      yield* Deferred.succeed(releaseNotifier, undefined)
+      const notice = yield* Deferred.await(injected).pipe(
+        Effect.timeoutOrElse({
+          duration: "2 seconds",
+          orElse: () => Effect.fail(new Error("promoted foreground settlement lost parent notice")),
+        }),
+      )
+      expect(notice.parts[0]?.type).toBe("text")
+      if (notice.parts[0]?.type === "text") expect(notice.parts[0].text).toContain("promoted done")
+      yield* Effect.sleep("20 millis")
+      expect(calls).toHaveLength(1)
+    }),
+  )
+
+  background.instance("timed-out first runs settle identically in foreground and background", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const sessions = yield* Session.Service
+      const outcomes = yield* TaskOutcomes.Service
+      const fakeBackground: BackgroundJob.Interface = {
+        list: () => Effect.succeed([]),
+        get: () => Effect.succeed(undefined),
+        start: (input) =>
+          Effect.succeed({
+            id: input.id ?? "task",
+            type: input.type,
+            status: "running" as const,
+            started_at: 0,
+          }),
+        extend: () => Effect.succeed(false),
+        wait: (input) =>
+          Effect.succeed({
+            timedOut: true,
+            info: { id: input.id, type: "task", status: "error" as const, started_at: 0, error: "first-run timeout" },
+          }),
+        waitForPromotion: () => Effect.never,
+        message: () => Effect.succeed(undefined),
+        waitForMessage: () => Effect.never,
+        promote: () => Effect.succeed(undefined),
+        cancel: () => Effect.succeed(undefined),
+      }
+      const task = yield* TaskTool.pipe(Effect.provideService(BackgroundJob.Service, fakeBackground))
+      const execute = (background: boolean, task_id: string) =>
+        Effect.gen(function* () {
+          const def = yield* task.init()
+          return yield* def.execute(
+            {
+              description: "timeout classifier",
+              prompt: "check the wait result",
+              subagent_type: "general",
+              background,
+              task_id,
+            },
+            {
+              sessionID: chat.id,
+              messageID: assistant.id,
+              agent: "build",
+              abort: new AbortController().signal,
+              extra: { promptOps: stubOps() },
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.void,
+            },
+          )
+        })
+      const foreground = yield* Effect.exit(execute(false, "foreground-timeout"))
+      expect(Exit.isFailure(foreground)).toBe(true)
+      const foregroundChild = (yield* sessions.children(chat.id)).find((child) => child.slug === "foreground-timeout")
+      expect(foregroundChild).toBeDefined()
+      if (!foregroundChild) return
+      expect((yield* outcomes.current(foregroundChild.id))?.last?.state).toBe("timed_out")
+      const background = yield* execute(true, "background-timeout")
+      const backgroundChild = (yield* sessions.children(chat.id)).find((child) => child.slug === "background-timeout")
+      expect(backgroundChild).toBeDefined()
+      if (!backgroundChild) return
+      expect(background.metadata.background).toBe(true)
+      const settled = yield* pollWithTimeout(
+        Effect.map(outcomes.current(backgroundChild.id), (entry) => entry?.last),
+        "background first run did not settle",
+        "3 seconds",
+      )
+      expect(settled.state).toBe("timed_out")
     }),
   )
 
@@ -1616,6 +1777,7 @@ describe("tool.task", () => {
       const promptOps: TaskPromptOps = {
         cancel: () => Effect.void,
         cancelRun: () => Effect.void,
+        loop: (sessionID) => Effect.succeed(reply({ sessionID, parts: [] }, "done")),
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
         prompt: (input) => {
           if (input.sessionID === chat.id) return Deferred.succeed(injected, input).pipe(Effect.as(reply(input, "injected")))
@@ -2511,6 +2673,7 @@ describe("tool.task", () => {
       const promptOps: TaskPromptOps = {
         cancel: () => Effect.void,
         cancelRun: () => Effect.void,
+        loop: (sessionID) => Effect.succeed(reply({ sessionID, parts: [] }, "done")),
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
         prompt: (input) =>
           Effect.sync(() => {
@@ -2622,6 +2785,7 @@ const itBroken = testEffect(Layer.provideMerge(brokenSessionLayer, withRipgrep()
       const promptOps: TaskPromptOps = {
         cancel: () => Effect.void,
         cancelRun: () => Effect.void,
+        loop: (sessionID) => Effect.succeed(reply({ sessionID, parts: [] }, "done")),
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
         prompt: (input) =>
           Effect.sync(() => {
@@ -2694,6 +2858,7 @@ const itBroken = testEffect(Layer.provideMerge(brokenSessionLayer, withRipgrep()
       const promptOps: TaskPromptOps = {
         cancel: () => Effect.void,
         cancelRun: () => Effect.void,
+        loop: (sessionID) => Effect.succeed(reply({ sessionID, parts: [] }, "done")),
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
         prompt: (input) =>
           Effect.sync(() => {
@@ -2763,6 +2928,7 @@ const itBroken = testEffect(Layer.provideMerge(brokenSessionLayer, withRipgrep()
       const promptOps: TaskPromptOps = {
         cancel: () => Effect.void,
         cancelRun: () => Effect.void,
+        loop: (sessionID) => Effect.succeed(reply({ sessionID, parts: [] }, "done")),
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
         prompt: (input) =>
           Effect.sync(() => {
@@ -2847,6 +3013,7 @@ const itBroken = testEffect(Layer.provideMerge(brokenSessionLayer, withRipgrep()
       const ops: TaskPromptOps = {
         cancel: () => Effect.void,
         cancelRun: () => Effect.sync(() => { cancelRuns.push(1) }),
+        loop: (sessionID) => Effect.succeed(reply({ sessionID, parts: [] }, "done")),
         resolvePromptParts: (template) => Effect.succeed([{ type: "text", text: template }]),
         prompt: (input) => {
           prompts.push(input)
@@ -2989,6 +3156,7 @@ const itBroken = testEffect(Layer.provideMerge(brokenSessionLayer, withRipgrep()
       const ops: TaskPromptOps = {
         cancel: () => Effect.void,
         cancelRun: () => Effect.sync(() => { cancelRuns.push(1) }),
+        loop: (sessionID) => Effect.succeed(reply({ sessionID, parts: [] }, "done")),
         resolvePromptParts: (template) => Effect.succeed([{ type: "text", text: template }]),
         prompt: (input) => {
           prompts.push(input)
@@ -3280,6 +3448,7 @@ const itBroken = testEffect(Layer.provideMerge(brokenSessionLayer, withRipgrep()
       const ops: TaskPromptOps = {
         cancel: () => Effect.void,
         cancelRun: () => Effect.void,
+        loop: (sessionID) => Effect.succeed(reply({ sessionID, parts: [] }, "done")),
         resolvePromptParts: (template) => Effect.succeed([{ type: "text", text: template }]),
         prompt: (input) => {
           prompts.push(input)
@@ -3327,6 +3496,7 @@ const itBroken = testEffect(Layer.provideMerge(brokenSessionLayer, withRipgrep()
       const ops: TaskPromptOps = {
         cancel: () => Effect.void,
         cancelRun: () => Effect.void,
+        loop: (sessionID) => Effect.succeed(reply({ sessionID, parts: [] }, "done")),
         resolvePromptParts: (template) => Effect.succeed([{ type: "text", text: template }]),
         prompt: (input) => {
           prompts.push(input)

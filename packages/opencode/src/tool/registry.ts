@@ -12,6 +12,8 @@ import { GlobTool } from "./glob"
 import { GrepTool } from "./grep"
 import { ReadTool } from "./read"
 import { TaskTool } from "./task"
+import { TaskOutcomes } from "./task-outcomes"
+import { SessionRunState } from "@/session/run-state"
 import { TaskReturnTool } from "./task-return"
 import { TaskSteerTool, TaskCancelTool, TaskAbortTool } from "./task-interrupt"
 import { Database } from "@opencode-ai/core/database/database"
@@ -462,12 +464,14 @@ export const node = LayerNode.make({
     Skill.node,
     Session.node,
     BackgroundJob.node,
+    TaskOutcomes.node,
     Provider.node,
     LSP.node,
     Instruction.node,
     FSUtil.node,
     EventV2Bridge.node,
     Interrupt.node,
+    SessionRunState.node,
     S2SStore.node,
     httpClient,
     CrossSpawnSpawner.node,
