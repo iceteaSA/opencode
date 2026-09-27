@@ -1,4 +1,4 @@
-Launch a new agent to handle complex, multistep tasks autonomously.
+Launch a new agent to handle complex, multistep tasks autonomously. Provide exactly one of `prompt` or `prompt_file`; `prompt_file` reads the file contents verbatim as the task prompt.
 
 When using the Task tool, you must specify a subagent_type parameter to select which agent type to use.
 

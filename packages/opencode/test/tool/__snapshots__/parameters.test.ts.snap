@@ -352,6 +352,10 @@ exports[`tool parameters JSON Schema (wire shape) task 1`] = `
       "description": "The task for the agent to perform",
       "type": "string",
     },
+    "prompt_file": {
+      "description": "Read the task prompt verbatim from this file. Specify exactly one of prompt or prompt_file.",
+      "type": "string",
+    },
     "resume": {
       "description": "Explicit consent to resume an existing idle task session named by task_id. Required when task_id refers to a session with no currently-running background job. A live background task still accepts task_id updates without this flag.",
       "type": "boolean",
@@ -382,7 +386,6 @@ exports[`tool parameters JSON Schema (wire shape) task 1`] = `
   },
   "required": [
     "description",
-    "prompt",
     "subagent_type",
   ],
   "type": "object",

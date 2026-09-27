@@ -29,6 +29,11 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { PositiveInt } from "@opencode-ai/core/schema"
 import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
 import { createHash } from "crypto"
+import path from "path"
+import { FSUtil } from "@opencode-ai/core/fs-util"
+import { InstanceState } from "@/effect/instance-state"
+import { permissionPath } from "@/project/instance-context"
+import { assertExternalDirectoryEffect } from "./external-directory"
 
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
@@ -76,7 +81,10 @@ function deriveSlugSessionID(slug: string, rootID: SessionID): SessionID {
 
 const BaseParameterFields = {
   description: Schema.String.annotate({ description: "A short (3-5 words) description of the task" }),
-  prompt: Schema.String.annotate({ description: "The task for the agent to perform" }),
+  prompt: Schema.optional(Schema.String).annotate({ description: "The task for the agent to perform" }),
+  prompt_file: Schema.optional(Schema.String).annotate({
+    description: "Read the task prompt verbatim from this file. Specify exactly one of prompt or prompt_file.",
+  }),
   subagent_type: Schema.String.annotate({ description: "The type of specialized agent to use for this task" }),
   model: Schema.optional(Schema.String).annotate({
     description:
@@ -239,6 +247,27 @@ export const TaskTool = Tool.define(
     const messaging = yield* Messaging.Service
     const events = yield* EventV2Bridge.Service
     const outcomes = yield* TaskOutcomes.Service
+    const fs = yield* FSUtil.Service
+
+    const readPromptFile = Effect.fn("TaskTool.readPromptFile")(function* (filepath: string, ctx: Tool.Context) {
+      const instance = yield* InstanceState.context
+      const resolved = path.isAbsolute(filepath) ? filepath : path.resolve(instance.directory, filepath)
+      yield* assertExternalDirectoryEffect(ctx, resolved, {
+        bypass: Boolean(ctx.extra?.["bypassCwdCheck"]),
+        kind: "file",
+      })
+      yield* ctx.ask({
+        permission: "read",
+        patterns: [permissionPath(resolved, instance)],
+        always: ["*"],
+        metadata: {},
+      })
+      return yield* fs.readFileString(resolved).pipe(
+        Effect.catchReason("PlatformError", "NotFound", () =>
+          Effect.fail(new Error(`Prompt file not found: ${filepath}`)),
+        ),
+      )
+    })
 
     const classifyFirstRun = (
       result: BackgroundJob.WaitResult,
@@ -339,6 +368,9 @@ export const TaskTool = Tool.define(
       params: Schema.Schema.Type<typeof Parameters>,
       ctx: Tool.Context,
     ) {
+      if ((params.prompt === undefined) === (params.prompt_file === undefined))
+        return yield* Effect.fail(new Error("Specify exactly one of prompt or prompt_file"))
+      const taskPrompt = params.prompt ?? (yield* readPromptFile(params.prompt_file!, ctx))
       const cfg = yield* config.get()
       const callingAgent = yield* agent.get(ctx.agent)
       const completionMode = resolveCompletionMode(params.completion, callingAgent!, cfg)
@@ -590,7 +622,7 @@ export const TaskTool = Tool.define(
         // Transcript enrichment must not turn a successful prompt into a failed task if its optional read dies.
         const before = yield* Effect.exit(sessions.messages({ sessionID: nextSession.id }))
         const previous = Exit.isSuccess(before) ? MessageV2.latest(before.value).assistant : undefined
-        const parts = yield* ops.resolvePromptParts(params.prompt)
+        const parts = yield* ops.resolvePromptParts(taskPrompt)
         const result = yield* ops.prompt({
           sessionID: nextSession.id,
           model: {

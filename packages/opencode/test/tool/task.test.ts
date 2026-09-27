@@ -1,6 +1,8 @@
 import { afterEach, describe, expect } from "bun:test"
+import path from "path"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Database } from "@opencode-ai/core/database/database"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
@@ -23,7 +25,7 @@ import { TaskReturnTool } from "../../src/tool/task-return"
 import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
 import { RuntimeFlags } from "@/effect/runtime-flags"
-import { disposeAllInstances } from "../fixture/fixture"
+import { disposeAllInstances, TestInstance } from "../fixture/fixture"
 import { pollWithTimeout, testEffect } from "../lib/effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -42,7 +44,8 @@ const ref = {
 const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
   LayerNode.compile(
     LayerNode.group([
-      Agent.node,
+       Agent.node,
+       FSUtil.node,
       BackgroundJob.node,
       TaskOutcomes.node,
       EventV2Bridge.node,
@@ -1318,6 +1321,158 @@ describe("tool.task", () => {
         },
       },
     },
+  )
+
+  it.instance(
+    "reads prompt_file verbatim through read permission",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* TestInstance
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const file = path.join(tmp.directory, "task-brief.md")
+        const promptText = "First line\n\n  keep indentation  \n"
+        yield* Effect.promise(() => Bun.write(file, promptText))
+        const permissions: unknown[] = []
+        let seen: SessionPrompt.PromptInput | undefined
+
+        yield* def.execute(
+          {
+            description: "read brief",
+            prompt_file: file,
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps({ onPrompt: (input) => (seen = input) }) },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: (input) => Effect.sync(() => permissions.push(input)),
+          },
+        )
+
+        expect(seen?.parts).toEqual([{ type: "text", text: promptText }])
+        expect(permissions).toContainEqual({
+          permission: "read",
+          patterns: [file],
+          always: ["*"],
+          metadata: {},
+        })
+      }),
+    { config: { agent: { general: { model: "openai/gpt-4o-mini" } } } },
+  )
+
+  it.instance("requires exactly one of prompt and prompt_file", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const exit = yield* def
+        .execute(
+          {
+            description: "invalid prompt source",
+            prompt: "inline",
+            prompt_file: "/brief.md",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps() },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("Specify exactly one of prompt or prompt_file")
+    }),
+  )
+
+  it.instance(
+    "reports a missing prompt_file clearly",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* TestInstance
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const file = path.join(tmp.directory, "missing-brief.md")
+        const exit = yield* def
+          .execute(
+            {
+              description: "missing brief",
+              prompt_file: file,
+              subagent_type: "general",
+            },
+            {
+              sessionID: chat.id,
+              messageID: assistant.id,
+              agent: "build",
+              abort: new AbortController().signal,
+              extra: { promptOps: stubOps() },
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.void,
+            },
+          )
+          .pipe(Effect.exit)
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain(`Prompt file not found: ${file}`)
+      }),
+    { config: { agent: { general: { model: "openai/gpt-4o-mini" } } } },
+  )
+
+  it.instance(
+    "asks external_directory before reading an out-of-worktree prompt_file",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* TestInstance
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const file = path.join(tmp.directory, "..", `outside-${path.basename(tmp.directory)}.md`)
+        yield* Effect.promise(() => Bun.write(file, "external brief"))
+        const requests: unknown[] = []
+        const exit = yield* def
+          .execute(
+            {
+              description: "external brief",
+              prompt_file: file,
+              subagent_type: "general",
+            },
+            {
+              sessionID: chat.id,
+              messageID: assistant.id,
+              agent: "build",
+              abort: new AbortController().signal,
+              extra: { promptOps: stubOps() },
+              messages: [],
+              metadata: () => Effect.void,
+              ask: (input) => {
+                return Effect.sync(() => requests.push(input)).pipe(Effect.asVoid)
+              },
+            },
+          )
+          .pipe(Effect.exit)
+
+        expect(Exit.isSuccess(exit)).toBe(true)
+        expect(requests).toContainEqual(
+          expect.objectContaining({
+            permission: "external_directory",
+            metadata: expect.objectContaining({ filepath: file }),
+          }),
+        )
+        expect(requests).toContainEqual(expect.objectContaining({ permission: "read" }))
+      }),
+    { config: { agent: { general: { model: "openai/gpt-4o-mini" } } } },
   )
 
   it.instance(
