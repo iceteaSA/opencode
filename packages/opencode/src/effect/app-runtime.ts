@@ -38,6 +38,7 @@ import { McpAuth } from "@/mcp/auth"
 import { Command } from "@/command"
 import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
+import { TaskOutcomes } from "@/tool/task-outcomes"
 import { Format } from "@/format"
 import { InstanceStore } from "@/project/instance-store"
 import { Project } from "@/project/project"
@@ -84,6 +85,7 @@ export const AppLayer = AppNodeBuilderV1.build(
     SessionProjector.node,
     SessionStatus.node,
     BackgroundJob.node,
+    TaskOutcomes.node,
     RuntimeFlags.node,
     EventV2Bridge.node,
     SessionRunState.node,

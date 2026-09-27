@@ -16,6 +16,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { Config } from "@/config/config"
 import { Agent } from "@/agent/agent"
 import { SessionRunState } from "@/session/run-state"
+import { TaskOutcomes } from "@/tool/task-outcomes"
 import { SessionStatus } from "@/session/status"
 import { Truncate } from "@/tool/truncate"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -40,6 +41,7 @@ const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
       Session.node,
       SessionProjector.node,
       SessionRunState.node,
+      TaskOutcomes.node,
       SessionStatus.node,
       Truncate.node,
       ToolRegistry.node,

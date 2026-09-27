@@ -7,6 +7,8 @@ import { Permission } from "@/permission"
 import { Agent } from "@/agent/agent"
 import { Messaging } from "@/messaging"
 import { SessionID } from "../session/schema"
+import { SessionRunState } from "@/session/run-state"
+import { TaskOutcomes } from "./task-outcomes"
 import { SubagentTarget } from "./subagent-target"
 import STEER_DESCRIPTION from "./task-steer.txt"
 import CANCEL_DESCRIPTION from "./task-cancel.txt"
@@ -29,6 +31,8 @@ const resolveChild = (
   sessions: Session.Interface,
   background: BackgroundJob.Interface,
   messaging: Messaging.Interface,
+  runState: SessionRunState.Interface,
+  outcomes: TaskOutcomes.Interface,
   taskId: string,
   callerSessionID: SessionID,
 ) =>
@@ -36,13 +40,27 @@ const resolveChild = (
     const resolved = yield* SubagentTarget.resolve(sessions, messaging, taskId, callerSessionID)
     if (resolved.kind === "not_found") return resolved
     const job = yield* background.get(resolved.childID)
-    return { ...resolved, running: !!job && job.status === "running" }
+    const current = yield* outcomes.current(resolved.childID)
+    const runnerBusy = yield* runState
+      .assertNotBusy(resolved.childID)
+      .pipe(Effect.match({ onFailure: () => true, onSuccess: () => false }))
+    return { ...resolved, running: job?.status === "running" || (!!current?.active && runnerBusy), last: current?.last }
   })
+
+const finishedSuffix = (last: TaskOutcomes.Settlement | undefined) =>
+  last ? ` Last run settled ${last.state} at ${new Date(last.settledAt).toISOString()}.` : ""
 
 export const TaskSteerTool = Tool.define<
   typeof SteerParameters,
   { task_id: string; state: string },
-  Interrupt.Service | Session.Service | BackgroundJob.Service | Permission.Service | Agent.Service | Messaging.Service
+  | Interrupt.Service
+  | Session.Service
+  | BackgroundJob.Service
+  | Permission.Service
+  | Agent.Service
+  | Messaging.Service
+  | SessionRunState.Service
+  | TaskOutcomes.Service
 >(
   "task_steer",
   Effect.gen(function* () {
@@ -52,12 +70,22 @@ export const TaskSteerTool = Tool.define<
     const permission = yield* Permission.Service
     const agents = yield* Agent.Service
     const messaging = yield* Messaging.Service
+    const runState = yield* SessionRunState.Service
+    const outcomes = yield* TaskOutcomes.Service
     return {
       description: STEER_DESCRIPTION,
       parameters: SteerParameters,
       execute: (params, ctx) =>
         Effect.gen(function* () {
-          const resolved = yield* resolveChild(sessions, background, messaging, params.task_id, ctx.sessionID)
+          const resolved = yield* resolveChild(
+            sessions,
+            background,
+            messaging,
+            runState,
+            outcomes,
+            params.task_id,
+            ctx.sessionID,
+          )
           if (resolved.kind === "not_found")
             return {
               title: "Steer: not found",
@@ -68,7 +96,7 @@ export const TaskSteerTool = Tool.define<
             return {
               title: "Steer: already finished",
               metadata: { task_id: params.task_id, state: "already_finished" },
-              output: `Subagent ${params.task_id} has already finished; nothing to steer.`,
+              output: `Subagent ${params.task_id} has already finished; nothing to steer.${finishedSuffix(resolved.last)}`,
             }
           const agent = yield* agents.get(ctx.agent)
           yield* permission.ask({
@@ -98,7 +126,14 @@ export const TaskSteerTool = Tool.define<
 export const TaskCancelTool = Tool.define<
   typeof CancelParameters,
   { task_id: string; state: string },
-  Interrupt.Service | Session.Service | BackgroundJob.Service | Permission.Service | Agent.Service | Messaging.Service
+  | Interrupt.Service
+  | Session.Service
+  | BackgroundJob.Service
+  | Permission.Service
+  | Agent.Service
+  | Messaging.Service
+  | SessionRunState.Service
+  | TaskOutcomes.Service
 >(
   "task_cancel",
   Effect.gen(function* () {
@@ -108,12 +143,22 @@ export const TaskCancelTool = Tool.define<
     const permission = yield* Permission.Service
     const agents = yield* Agent.Service
     const messaging = yield* Messaging.Service
+    const runState = yield* SessionRunState.Service
+    const outcomes = yield* TaskOutcomes.Service
     return {
       description: CANCEL_DESCRIPTION,
       parameters: CancelParameters,
       execute: (params, ctx) =>
         Effect.gen(function* () {
-          const resolved = yield* resolveChild(sessions, background, messaging, params.task_id, ctx.sessionID)
+          const resolved = yield* resolveChild(
+            sessions,
+            background,
+            messaging,
+            runState,
+            outcomes,
+            params.task_id,
+            ctx.sessionID,
+          )
           if (resolved.kind === "not_found")
             return {
               title: "Cancel: not found",
@@ -124,7 +169,7 @@ export const TaskCancelTool = Tool.define<
             return {
               title: "Cancel: already finished",
               metadata: { task_id: params.task_id, state: "already_finished" },
-              output: `Subagent ${params.task_id} has already finished; nothing to cancel.`,
+              output: `Subagent ${params.task_id} has already finished; nothing to cancel.${finishedSuffix(resolved.last)}`,
             }
           const agent = yield* agents.get(ctx.agent)
           yield* permission.ask({
@@ -154,7 +199,14 @@ export const TaskCancelTool = Tool.define<
 export const TaskAbortTool = Tool.define<
   typeof AbortParameters,
   { task_id: string; state: string },
-  Interrupt.Service | Session.Service | BackgroundJob.Service | Permission.Service | Agent.Service | Messaging.Service
+  | Interrupt.Service
+  | Session.Service
+  | BackgroundJob.Service
+  | Permission.Service
+  | Agent.Service
+  | Messaging.Service
+  | SessionRunState.Service
+  | TaskOutcomes.Service
 >(
   "task_abort",
   Effect.gen(function* () {
@@ -164,12 +216,22 @@ export const TaskAbortTool = Tool.define<
     const permission = yield* Permission.Service
     const agents = yield* Agent.Service
     const messaging = yield* Messaging.Service
+    const runState = yield* SessionRunState.Service
+    const outcomes = yield* TaskOutcomes.Service
     return {
       description: ABORT_DESCRIPTION,
       parameters: AbortParameters,
       execute: (params, ctx) =>
         Effect.gen(function* () {
-          const resolved = yield* resolveChild(sessions, background, messaging, params.task_id, ctx.sessionID)
+          const resolved = yield* resolveChild(
+            sessions,
+            background,
+            messaging,
+            runState,
+            outcomes,
+            params.task_id,
+            ctx.sessionID,
+          )
           if (resolved.kind === "not_found")
             return {
               title: "Abort: not found",
@@ -180,7 +242,7 @@ export const TaskAbortTool = Tool.define<
             return {
               title: "Abort: already finished",
               metadata: { task_id: params.task_id, state: "already_finished" },
-              output: `Subagent ${params.task_id} has already finished.`,
+              output: `Subagent ${params.task_id} has already finished.${finishedSuffix(resolved.last)}`,
             }
           const agent = yield* agents.get(ctx.agent)
           yield* permission.ask({
@@ -194,7 +256,7 @@ export const TaskAbortTool = Tool.define<
           // Route through the shared abort helper so tool-issued and HTTP-issued
           // aborts produce identical visible markers and terminal records.
           yield* Interrupt.abortChild(
-            { sessions, background, interrupt },
+            { sessions, background, interrupt, runState },
             { childID: resolved.childID, origin: "parent", reason: params.reason },
           )
           return {

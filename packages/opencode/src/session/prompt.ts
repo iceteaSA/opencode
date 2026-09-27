@@ -52,6 +52,7 @@ import * as DateTime from "effect/DateTime"
 import { InstanceState } from "@/effect/instance-state"
 import { attach } from "@/effect/run-service"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
+import { TaskOutcomes } from "@/tool/task-outcomes"
 import { SessionRunState } from "./run-state"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -166,6 +167,7 @@ export const layer = Layer.effect(
     const database = yield* Database.Service
     const interrupt = yield* Interrupt.Service
     const messaging = yield* Messaging.Service
+    const outcomes = yield* TaskOutcomes.Service
     const { db } = database
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       return {
@@ -178,6 +180,7 @@ export const layer = Layer.effect(
               error instanceof SessionRunState.LeaseLostError ? Effect.fail(error) : Effect.die(error),
             ),
           ),
+        loop: (sessionID: SessionID) => loop({ sessionID }),
       } satisfies TaskPromptOps
     })
 
@@ -1743,7 +1746,68 @@ export const layer = Layer.effect(
           ),
         )
       }
-      return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+      return yield* state.ensureRunning(
+        input.sessionID,
+        lastAssistant(input.sessionID),
+        Effect.gen(function* () {
+          const observed: { exit?: Exit.Exit<SessionV1.WithParts, SessionRunState.LeaseLostError> } = {}
+          const settled = yield* outcomes.runWake(
+            input.sessionID,
+            Effect.gen(function* () {
+              const previous = yield* lastAssistant(input.sessionID)
+              yield* sessions.setResult({ sessionID: input.sessionID, result: null })
+              const message = yield* runLoop(input.sessionID).pipe(
+                Effect.onExit((exit) =>
+                  Effect.sync(() => {
+                    observed.exit = exit
+                  }),
+                ),
+              )
+              const text =
+                message.info.id === previous.info.id || message.info.role !== "assistant"
+                  ? ""
+                  : message.parts
+                      .filter((part) => part.type === "text")
+                      .map((part) => part.text)
+                      .join("\n")
+              const error = message.info.role === "assistant" ? message.info.error : undefined
+              const transcript =
+                !error && !text.trim()
+                  ? yield* Effect.exit(sessions.messages({ sessionID: input.sessionID }))
+                  : undefined
+              const failed =
+                transcript && Exit.isSuccess(transcript)
+                  ? TaskOutcomes.toolErrorSince(
+                      transcript.value,
+                      previous.info.role === "assistant" ? previous.info : undefined,
+                    )
+                  : undefined
+              return {
+                state: error || failed ? ("error" as const) : ("completed" as const),
+                text,
+                hasFinalText: !!text.trim(),
+                failure: error
+                  ? TaskOutcomes.failureFromError(error)
+                  : failed
+                    ? { kind: "provider_or_tool_error" as const, message: failed }
+                    : undefined,
+              }
+            }),
+            Effect.gen(function* () {
+              if (Option.isSome(yield* interrupt.terminal(input.sessionID))) return true
+              return (yield* interrupt.list()).some(
+                (pending) => pending.sessionID === input.sessionID && pending.intent === "cancel",
+              )
+            }),
+          )
+          if (!settled) return yield* runLoop(input.sessionID)
+          if (observed.exit) {
+            if (Exit.isSuccess(observed.exit)) return observed.exit.value
+            return yield* Effect.failCause(observed.exit.cause)
+          }
+          return yield* new SessionRunState.LeaseLostError({ sessionID: input.sessionID })
+        }),
+      )
     })
 
     const shell: (
@@ -2029,6 +2093,7 @@ export const node = LayerNode.make({
     Database.node,
     Interrupt.node,
     Messaging.node,
+    TaskOutcomes.node,
   ],
 })
 

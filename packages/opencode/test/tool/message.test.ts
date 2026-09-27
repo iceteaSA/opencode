@@ -87,6 +87,7 @@ function stubOps(
   return {
     cancel: () => Effect.void,
     cancelRun: () => Effect.void,
+    loop: (sessionID) => stubOps().prompt({ sessionID, parts: [] }),
     resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
     prompt: (input) =>
       Effect.sync(() => {
