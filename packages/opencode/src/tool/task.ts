@@ -549,10 +549,23 @@ export const TaskTool = Tool.define(
         modelID: msg.info.modelID,
         providerID: msg.info.providerID,
       }
+      const modelSource = overrideModel
+        ? "requested_model"
+        : resumedModel
+          ? "resumed_session"
+          : next.model
+            ? "agent_default"
+            : "parent_model"
+      const primaryVariant = params.variant ?? resumedVariant ?? (overrideModel || resumedModel || next.model ? undefined : variant)
+      let actualModel = model
+      let actualVariant = primaryVariant
+      let actualModelSource = modelSource
       const metadata = {
         parentSessionId: ctx.sessionID,
         sessionId: nextSession.id,
         model,
+        variant: primaryVariant,
+        model_source: modelSource,
         ...(runInBackground ? { background: true } : {}),
       }
 
@@ -588,6 +601,10 @@ export const TaskTool = Tool.define(
           agent: next.name,
           parts,
         })
+        if (result.info.role === "assistant") {
+          actualModel = { modelID: result.info.modelID, providerID: result.info.providerID }
+          actualVariant = result.info.variant
+        }
         evidence.finalText = result.parts
           .filter((part) => part.type === "text")
           .map((part) => part.text)
@@ -617,7 +634,6 @@ export const TaskTool = Tool.define(
 
       let fallbackUsed = false
       const runTask = Effect.fn("TaskTool.runTask")(function* () {
-        const primaryVariant = params.variant ?? resumedVariant ?? (overrideModel || resumedModel || next.model ? undefined : variant)
         const attempt = (m: { modelID: ModelV2.ID; providerID: ProviderV2.ID }, v: string | undefined) => {
           evidence.finalText = ""
           evidence.failure = undefined
@@ -650,6 +666,9 @@ export const TaskTool = Tool.define(
         )
           return yield* Effect.failCause(exit.cause)
         fallbackUsed = true
+        actualModel = fallbackModel
+        actualVariant = params.variant ?? resumedVariant
+        actualModelSource = "fallback_model"
         const fallbackExit = yield* Effect.exit(attempt(fallbackModel, params.variant ?? resumedVariant))
         if (Exit.isFailure(fallbackExit)) {
           yield* cancelRun()
@@ -930,15 +949,33 @@ export const TaskTool = Tool.define(
             }
           }
           yield* events.publish(Event.Completed, yield* completedPayload(nextSession.id, ctx.sessionID, "ok", startedAt))
-          const displayMetadata = fallbackUsed ? { ...metadata, fallback_used: true as const } : metadata
+          const modelChanged =
+            actualModel.providerID !== model.providerID || actualModel.modelID !== model.modelID
+          const variantChanged = (actualVariant ?? "default") !== (primaryVariant ?? "default")
+          const modelNotice =
+            modelChanged || variantChanged
+              ? `Model used: ${actualModel.providerID}/${actualModel.modelID} ` +
+                `(variant: ${actualVariant ?? "default"}; source: ${actualModelSource})\n`
+              : ""
+          const displayMetadata = {
+            ...metadata,
+            model: actualModel,
+            variant: actualVariant,
+            model_source: actualModelSource,
+            ...(fallbackUsed ? { fallback_used: true as const } : {}),
+          }
           const outputText = result?.output ?? ""
           return {
             title: params.description,
             metadata: displayMetadata,
             output:
               completionMode === "terse"
-                ? terseText(outputText, childResult, nextSession.id, childVal?.slug)
-                : renderOutput({ sessionID: nextSession.id, state: "completed", text: outputText }) +
+                ? modelNotice + terseText(outputText, childResult, nextSession.id, childVal?.slug)
+                : renderOutput({
+                    sessionID: nextSession.id,
+                    state: "completed",
+                    text: modelNotice + outputText,
+                  }) +
                   childResultBlock(childResult),
           }
           }),

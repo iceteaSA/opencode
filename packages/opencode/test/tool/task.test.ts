@@ -1355,6 +1355,8 @@ describe("tool.task", () => {
 
         expect(result.metadata.model.providerID as string).toBe("anthropic")
         expect(result.metadata.model.modelID as string).toBe("claude-sonnet-4")
+        expect(result.metadata.variant).toBeUndefined()
+        expect(result.metadata.model_source).toBe("requested_model")
         expect((seen?.model?.providerID ?? "") as string).toBe("anthropic")
         expect((seen?.model?.modelID ?? "") as string).toBe("claude-sonnet-4")
         expect(calls[0]).toEqual({
@@ -3184,6 +3186,7 @@ const itBroken = testEffect(Layer.provideMerge(brokenSessionLayer, withRipgrep()
           subagent_type: "general",
           timeout: 2000,
           fallback_model: "openai/gpt-4o",
+          variant: "thinking",
         },
         {
           sessionID: chat.id,
@@ -3202,7 +3205,13 @@ const itBroken = testEffect(Layer.provideMerge(brokenSessionLayer, withRipgrep()
       expect((prompts[1]?.model?.providerID ?? "") as string).toBe("openai")
       expect((prompts[1]?.model?.modelID ?? "") as string).toBe("gpt-4o")
       expect(result.output).toContain("fallback says hi")
+      expect(result.output).toContain(
+        "Model used: openai/gpt-4o (variant: default; source: fallback_model)",
+      )
       expect((result.metadata as { fallback_used?: boolean }).fallback_used).toBe(true)
+      expect(result.metadata.model).toMatchObject({ providerID: "openai", modelID: "gpt-4o" })
+      expect(result.metadata.variant).toBeUndefined()
+      expect(result.metadata.model_source).toBe("fallback_model")
     }),
   )
 
