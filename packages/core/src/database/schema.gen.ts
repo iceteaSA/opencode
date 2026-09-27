@@ -50,6 +50,31 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`s2s_message\` (
+          \`id\` text PRIMARY KEY,
+          \`target_session_id\` text NOT NULL,
+          \`from_session_id\` text NOT NULL,
+          \`from_slug\` text NOT NULL,
+          \`capsule\` text NOT NULL,
+          \`sent_at\` integer NOT NULL,
+          \`delivered_at\` integer,
+          \`expired_at\` integer,
+          \`superseded_at\` integer,
+          \`supersedes\` text,
+          \`expires_at\` integer,
+          \`deliver_at\` integer,
+          \`transcript_message_id\` text
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`s2s_presence\` (
+          \`session_id\` text PRIMARY KEY,
+          \`owner_id\` text NOT NULL,
+          \`capability_version\` integer NOT NULL,
+          \`heartbeat_at\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`s2s_sent\` (
           \`dedupe_key\` text PRIMARY KEY,
           \`recipient_session_id\` text NOT NULL,
@@ -65,6 +90,22 @@ export default {
           \`accepted_by\` text,
           \`accepted_at\` integer,
           \`created_at\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`scheduled_task\` (
+          \`id\` text PRIMARY KEY,
+          \`parent_session_id\` text NOT NULL,
+          \`child_session_id\` text,
+          \`slug\` text,
+          \`dispatch_inputs\` text NOT NULL,
+          \`due_at\` integer NOT NULL,
+          \`admitted_at\` integer NOT NULL,
+          \`claimed_at\` integer,
+          \`claim_owner\` text,
+          \`started_at\` integer,
+          \`state\` text NOT NULL,
+          \`failure_reason\` text
         );
       `)
       yield* tx.run(`
@@ -283,7 +324,14 @@ export default {
         );
       `)
       yield* tx.run(`CREATE INDEX \`s2s_inbox_target\` ON \`s2s_inbox\` (\`target_session_id\`,\`drained_at\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`s2s_message_pending\` ON \`s2s_message\` (\`target_session_id\`,\`deliver_at\`,\`delivered_at\`);`,
+      )
+      yield* tx.run(`CREATE INDEX \`s2s_message_sender_sent\` ON \`s2s_message\` (\`from_session_id\`,\`sent_at\`);`)
       yield* tx.run(`CREATE INDEX \`s2s_sent_recipient\` ON \`s2s_sent\` (\`recipient_session_id\`,\`time_created\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`scheduled_task_due\` ON \`scheduled_task\` (\`parent_session_id\`,\`due_at\`,\`state\`);`,
+      )
       yield* tx.run(`CREATE UNIQUE INDEX \`event_aggregate_seq_idx\` ON \`event\` (\`aggregate_id\`,\`seq\`);`)
       yield* tx.run(`CREATE INDEX \`event_aggregate_type_seq_idx\` ON \`event\` (\`aggregate_id\`,\`type\`,\`seq\`);`)
       yield* tx.run(
