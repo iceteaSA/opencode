@@ -6,6 +6,8 @@ import { sql } from "drizzle-orm"
 import { Effect } from "effect"
 import { DatabaseMigration } from "../src/database/migration"
 import { migrations } from "../src/database/migration.gen"
+import { Flock } from "../src/util/flock"
+import { Global } from "../src/global"
 import { tmpdir } from "./fixture/tmpdir"
 import path from "path"
 
@@ -18,6 +20,7 @@ const columns = (db: EffectDrizzleSqlite.EffectSQLiteDatabase, table: string) =>
 
 test("creates canonical mail, presence and scheduled tasks on fresh databases and reopens their rows", async () => {
   await using tmp = await tmpdir()
+  Flock.setGlobal({ state: Global.Path.state })
   const filename = path.join(tmp.path, "fresh.sqlite")
   await run(filename, Effect.gen(function* () {
     const db = yield* makeDb
