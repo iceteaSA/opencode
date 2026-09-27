@@ -44,8 +44,8 @@ const ref = {
 const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
   LayerNode.compile(
     LayerNode.group([
-       Agent.node,
-       FSUtil.node,
+      Agent.node,
+      FSUtil.node,
       BackgroundJob.node,
       TaskOutcomes.node,
       EventV2Bridge.node,
