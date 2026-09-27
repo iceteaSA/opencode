@@ -961,55 +961,55 @@ export const TaskTool = Tool.define(
                         text: outputText,
                       }) + childResultBlock(childResult),
               }
-          }
-          const aborted = yield* interrupt.terminal(nextSession.id)
-          if (Option.isSome(aborted)) {
-            yield* events.publish(Event.Completed, yield* completedPayload(nextSession.id, ctx.sessionID, "aborted", startedAt))
-            const outputText = result?.output ?? ""
-            return {
-              title: params.description,
-              metadata,
-              output:
-                completionMode === "terse"
-                  ? terseText(outputText, childResult, nextSession.id, childVal?.slug)
-                  : renderOutput({
-                      sessionID: nextSession.id,
-                      state: "aborted",
-                      summary: `Aborted: ${aborted.value.reason}`,
-                      text: outputText,
-                    }) + childResultBlock(childResult),
-            }
-          }
-          yield* events.publish(Event.Completed, yield* completedPayload(nextSession.id, ctx.sessionID, "ok", startedAt))
-          const modelChanged =
-            actualModel.providerID !== model.providerID || actualModel.modelID !== model.modelID
-          const variantChanged = (actualVariant ?? "default") !== (primaryVariant ?? "default")
-          const modelNotice =
-            modelChanged || variantChanged
-              ? `Model used: ${actualModel.providerID}/${actualModel.modelID} ` +
-                `(variant: ${actualVariant ?? "default"}; source: ${actualModelSource})\n`
-              : ""
-          const displayMetadata = {
-            ...metadata,
-            model: actualModel,
-            variant: actualVariant,
-            model_source: actualModelSource,
-            ...(fallbackUsed ? { fallback_used: true as const } : {}),
-          }
-          const outputText = result?.output ?? ""
-          return {
-            title: params.description,
-            metadata: displayMetadata,
-            output:
-              completionMode === "terse"
-                ? modelNotice + terseText(outputText, childResult, nextSession.id, childVal?.slug)
-                : renderOutput({
-                    sessionID: nextSession.id,
-                    state: "completed",
-                    text: modelNotice + outputText,
-                  }) +
-                  childResultBlock(childResult),
-          }
+              }
+              const aborted = yield* interrupt.terminal(nextSession.id)
+              if (Option.isSome(aborted)) {
+                yield* events.publish(Event.Completed, yield* completedPayload(nextSession.id, ctx.sessionID, "aborted", startedAt))
+                const outputText = result?.output ?? ""
+                return {
+                  title: params.description,
+                  metadata,
+                  output:
+                    completionMode === "terse"
+                      ? terseText(outputText, childResult, nextSession.id, childVal?.slug)
+                      : renderOutput({
+                          sessionID: nextSession.id,
+                          state: "aborted",
+                          summary: `Aborted: ${aborted.value.reason}`,
+                          text: outputText,
+                        }) + childResultBlock(childResult),
+                }
+              }
+              yield* events.publish(Event.Completed, yield* completedPayload(nextSession.id, ctx.sessionID, "ok", startedAt))
+              const modelChanged =
+                actualModel.providerID !== model.providerID || actualModel.modelID !== model.modelID
+              const variantChanged = (actualVariant ?? "default") !== (primaryVariant ?? "default")
+              const modelNotice =
+                modelChanged || variantChanged
+                  ? `Model used: ${actualModel.providerID}/${actualModel.modelID} ` +
+                    `(variant: ${actualVariant ?? "default"}; source: ${actualModelSource})\n`
+                  : ""
+              const displayMetadata = {
+                ...metadata,
+                model: actualModel,
+                variant: actualVariant,
+                model_source: actualModelSource,
+                ...(fallbackUsed ? { fallback_used: true as const } : {}),
+              }
+              const outputText = result?.output ?? ""
+              return {
+                title: params.description,
+                metadata: displayMetadata,
+                output:
+                  completionMode === "terse"
+                    ? modelNotice + terseText(outputText, childResult, nextSession.id, childVal?.slug)
+                    : renderOutput({
+                        sessionID: nextSession.id,
+                        state: "completed",
+                        text: modelNotice + outputText,
+                      }) +
+                      childResultBlock(childResult),
+              }
           }),
         (_, exit) =>
           Effect.gen(function* () {
