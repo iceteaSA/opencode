@@ -260,8 +260,8 @@ describe("tool parameters", () => {
       })
       expect(parsed.metadata).toEqual({ domain: "code-review", family: "anthropic" })
     })
-    test("rejects missing prompt", () => {
-      expect(accepts(Task, { description: "d", subagent_type: "general" })).toBe(false)
+    test("accepts prompt_file in place of prompt", () => {
+      expect(accepts(Task, { description: "d", subagent_type: "general", prompt_file: "brief.md" })).toBe(true)
     })
     test("accepts optional resume flag", () => {
       const parsed = parse(Task, { description: "d", prompt: "p", subagent_type: "general", task_id: "x-y", resume: true })
