@@ -1,10 +1,10 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { test, expect } from "bun:test"
 import os from "os"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Logger } from "effect"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
-import { Permission } from "../../src/permission"
+import { Permission, redactCommand } from "../../src/permission"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
 import { InstanceStore } from "../../src/project/instance-store"
 import { TestInstance, tmpdirScoped } from "../fixture/fixture"
@@ -19,6 +19,36 @@ const env = AppNodeBuilder.build(
   [[InstanceStore.bootstrapNode, noopBootstrap]],
 )
 const it = testEffect(env)
+
+test("redacts common credentials from permission command logs", () => {
+  const command =
+    "curl -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9' https://x sk-example123 ghp_abcdefghijklmnopqrstuvwxyz123456 github_pat_abcdefghijklmnopqrstuvwxyz123456 xoxb-1234-abcdef AKIAIOSFODNN7EXAMPLE --password=hunter2 password=correct-horse --token=token-value --secret=secret-value"
+  const result = redactCommand(command)
+
+  for (const secret of [
+    "eyJhbGciOiJIUzI1NiJ9",
+    "sk-example123",
+    "ghp_abcdefghijklmnopqrstuvwxyz123456",
+    "github_pat_abcdefghijklmnopqrstuvwxyz123456",
+    "xoxb-1234-abcdef",
+    "AKIAIOSFODNN7EXAMPLE",
+    "hunter2",
+    "correct-horse",
+    "token-value",
+    "secret-value",
+  ])
+    expect(result).not.toContain(secret)
+})
+
+test("preserves git hashes, SHA-256 digests, and UUIDs in commands", () => {
+  const command =
+    "git show 0123456789abcdef0123456789abcdef01234567 docker pull example/app@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef 550e8400-e29b-41d4-a716-446655440000"
+  const result = redactCommand(command)
+
+  expect(result).toContain("0123456789abcdef0123456789abcdef01234567")
+  expect(result).toContain("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+  expect(result).toContain("550e8400-e29b-41d4-a716-446655440000")
+})
 
 const rejectAll = (message?: string) =>
   Effect.gen(function* () {
@@ -554,6 +584,40 @@ test("disabled - specific allow overrides wildcard deny", () => {
 })
 
 // ask tests
+
+it.instance(
+  "ask - redacts bash command patterns in the asking log",
+  () =>
+    Effect.gen(function* () {
+      const secret = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+      const logs: unknown[] = []
+      const fiber = yield* ask({
+        sessionID: SessionID.make("session_test"),
+        permission: "bash",
+        patterns: [`printf ${secret}`],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(
+        Effect.provide(
+          Logger.layer([
+            Logger.make<unknown, void>((options) => {
+              logs.push(options.message)
+            }),
+          ]),
+        ),
+        Effect.forkScoped,
+      )
+
+      yield* waitForPending(1)
+      const output = JSON.stringify(logs)
+      expect(output).toContain("[REDACTED]")
+      expect(output).not.toContain(secret)
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
+    }),
+  { git: true },
+)
 
 it.instance(
   "ask - resolves immediately when action is allow",
