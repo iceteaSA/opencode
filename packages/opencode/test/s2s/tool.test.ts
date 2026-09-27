@@ -38,6 +38,7 @@
 
 import { describe, expect } from "bun:test"
 import { Cause, Effect, Exit, Layer, Option } from "effect"
+import { sql } from "drizzle-orm"
 import { Agent } from "../../src/agent/agent"
 import { Config } from "@/config/config"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -57,6 +58,7 @@ import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { testEffectShared } from "../lib/effect"
+import { countUndelivered } from './fixtures/undelivered-count';
 
 const database = Database.layerFromPath(":memory:")
 const s2sFlags = RuntimeFlags.layer({
@@ -348,7 +350,7 @@ describe("S2STool", () => {
     }),
   )
 
-  it.instance("msg to an allow-listed peer that is NOT in-process writes a s2s_inbox row via enqueueExternal", () =>
+  it.instance("msg to an allow-listed peer that is NOT in-process writes a canonical message", () =>
     Effect.gen(function* () {
       const store = yield* S2SStore.Service
       // Two real sessions; the target is addressed by session_id and
@@ -365,7 +367,7 @@ describe("S2STool", () => {
       const tool = yield* S2STool
       const def = yield* tool.init()
       const result = yield* def.execute({ command: "msg", target: target.id, body: "ping" }, ctxFor(inviter.id))
-      expect(result.output).toContain("Persisted to s2s_inbox")
+      expect(result.output).toContain("Persisted to s2s_message")
       expect(result.metadata.allowance).toEqual({
         used: 1,
         limit: 50,
@@ -378,7 +380,7 @@ describe("S2STool", () => {
       expect(duplicate.metadata.allowance).toEqual(result.metadata.allowance)
       expect(duplicate.output).toContain("1/50 used, 49 remaining")
       // The row is there.
-      const rows = yield* store.claimForSessions([target.id])
+      const rows = yield* store.pendingForSession(target.id, Date.now())
       expect(rows).toHaveLength(1)
       const decoded = decodeCapsule(rows[0]!.capsule)
       expect(decoded.body).toBe("ping")
@@ -433,14 +435,14 @@ describe("S2STool", () => {
 
       const result = yield* def.execute({ command: "msg", target: target.id, body: "moving" }, ctxFor(sender.id))
 
-      expect(result.output).toContain("Persisted to s2s_inbox")
-      expect(yield* store.countUndelivered(target.id)).toBe(1)
+      expect(result.output).toContain("Persisted to s2s_message")
+      expect(yield* countUndelivered(target.id)).toBe(1)
       expect(yield* messaging.drain(target.id)).toEqual([])
       expect(yield* messaging.localSet()).not.toContain(target.id)
     }),
   )
 
-  it.instance("msg to a same-process peer says it does not use the cross-process allowance", () =>
+  it.instance("local peer uses canonical dedupe and sender quota", () =>
     Effect.gen(function* () {
       const sessions = yield* Session.Service
       const messaging = yield* Messaging.Service
@@ -470,9 +472,70 @@ describe("S2STool", () => {
 
       const result = yield* def.execute({ command: "msg", target: target.id, body: "local" }, ctxFor(sender.id))
 
-      expect(result.output).toContain("same process; does not count toward the cross-process allowance")
-      expect(result.output).toContain("Cross-process sends this UTC clock hour: 0/50 used")
-      expect(yield* store.countUndelivered(target.id)).toBe(0)
+      expect(result.output).toContain("stored pending")
+      expect(result.metadata.allowance?.used).toBe(1)
+      const firstRow = (yield* store.pendingForSession(target.id, Date.now()))[0]
+      expect(firstRow?.id).toBeDefined()
+      const duplicate = yield* def.execute({ command: "msg", target: target.id, body: "local" }, ctxFor(sender.id))
+      expect(duplicate.output).toContain(firstRow?.id)
+      expect(duplicate.metadata.allowance?.used).toBe(1)
+      expect(yield* store.pendingForSession(target.id, Date.now())).toHaveLength(1)
+      expect(yield* messaging.drain(target.id)).toEqual([])
+      for (let index = 1; index < 50; index++) yield* def.execute({ command: "msg", target: target.id, body: `local-${index}` }, ctxFor(sender.id))
+      const rejected = yield* def.execute({ command: "msg", target: target.id, body: "local-51" }, ctxFor(sender.id)).pipe(Effect.exit)
+      expect(Exit.isFailure(rejected)).toBe(true)
+      expect(yield* store.pendingForSession(target.id, Date.now())).toHaveLength(50)
+    }),
+  )
+
+  it.instance("counts legacy pending rows with canonical pending mail at the recipient cap", () =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      const store = yield* S2SStore.Service
+      const messaging = yield* Messaging.Service
+      const sender = yield* seedSession("sender-cap")
+      const local = yield* seedSession("target-local-cap")
+      const remote = yield* seedSession("target-remote-cap")
+      yield* store.insertAllow(sender.id, local.id)
+      yield* store.insertAllow(sender.id, remote.id)
+      yield* messaging.registerLocal(local.id)
+      for (const recipient of [local.id, remote.id]) {
+        for (let index = 0; index < 49; index++) yield* store.insertInbox({ id: `inb_legacy_${recipient}_${index}`, targetSessionID: recipient, fromSessionID: sender.id, fromSlug: sender.autoSlug, capsule: "{}", timeCreated: index })
+        yield* db.run(sql`INSERT INTO s2s_message (id, target_session_id, from_session_id, from_slug, capsule, sent_at) VALUES (${`inb_canonical_${recipient}`}, ${recipient}, ${sender.id}, ${sender.autoSlug}, '{}', 1)`)
+      }
+      const tool = yield* S2STool
+      const def = yield* tool.init()
+      expect(Exit.isFailure(yield* def.execute({ command: "msg", target: local.id, body: "over-local" }, ctxFor(sender.id)).pipe(Effect.exit))).toBe(true)
+      expect(Exit.isFailure(yield* def.execute({ command: "msg", target: remote.id, body: "over-remote" }, ctxFor(sender.id)).pipe(Effect.exit))).toBe(true)
+      expect(yield* store.pendingForSession(local.id, Date.now())).toHaveLength(1)
+      expect(yield* store.pendingForSession(remote.id, Date.now())).toHaveLength(1)
+    }),
+  )
+
+  it.instance("accepts unknown or stale capability and refuses only a fresh lower version", () =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      const store = yield* S2SStore.Service
+      const sender = yield* seedSession("sender-capability")
+      const unknown = yield* seedSession("target-unknown")
+      const stale = yield* seedSession("target-stale")
+      const incompatible = yield* seedSession("target-incompatible")
+      const current = yield* seedSession("target-current")
+      for (const peer of [unknown, stale, incompatible, current]) yield* store.insertAllow(sender.id, peer.id)
+      yield* db.run(sql`INSERT INTO s2s_presence (session_id, owner_id, capability_version, heartbeat_at) VALUES (${stale.id}, 'old', 0, ${Date.now() - 60_000}), (${incompatible.id}, 'old', 0, ${Date.now()}), (${current.id}, 'current', 1, ${Date.now()})`)
+      const tool = yield* S2STool
+      const def = yield* tool.init()
+      const pending = yield* def.execute({ command: "msg", target: unknown.id, body: "unknown" }, ctxFor(sender.id))
+      expect(pending.output).toContain("No current presence record; stored pending and will deliver when the recipient runs a current build.")
+      expect(yield* store.pendingForSession(unknown.id, Date.now())).toHaveLength(1)
+      const staleResult = yield* def.execute({ command: "msg", target: stale.id, body: "stale" }, ctxFor(sender.id))
+      expect(staleResult.output).toContain("stored pending")
+      const denied = yield* def.execute({ command: "msg", target: incompatible.id, body: "incompatible" }, ctxFor(sender.id)).pipe(Effect.exit)
+      expect(Exit.isFailure(denied)).toBe(true)
+      if (Exit.isFailure(denied)) expect(Cause.pretty(denied.cause)).toContain("Recipient is running an incompatible S2S build (capability 0); upgrade it and retry.")
+      expect(yield* store.pendingForSession(incompatible.id, Date.now())).toHaveLength(0)
+      const accepted = yield* def.execute({ command: "msg", target: current.id, body: "current" }, ctxFor(sender.id))
+      expect(accepted.output).toContain("Persisted to s2s_message")
     }),
   )
 

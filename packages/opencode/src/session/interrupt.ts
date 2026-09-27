@@ -184,6 +184,7 @@ export const abortChild = (
           sessionID: input.childID,
           role: "user",
           time: { created },
+          origin: "system",
           agent: lastUser.agent,
           model: lastUser.model,
         }

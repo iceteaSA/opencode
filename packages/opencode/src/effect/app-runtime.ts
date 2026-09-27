@@ -39,6 +39,7 @@ import { Command } from "@/command"
 import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
 import { TaskOutcomes } from "@/tool/task-outcomes"
+import { ScheduledTaskStore } from "@/tool/scheduled-task-store"
 import { Format } from "@/format"
 import { InstanceStore } from "@/project/instance-store"
 import { Project } from "@/project/project"
@@ -86,6 +87,7 @@ export const AppLayer = AppNodeBuilderV1.build(
     SessionStatus.node,
     BackgroundJob.node,
     TaskOutcomes.node,
+    ScheduledTaskStore.node,
     RuntimeFlags.node,
     EventV2Bridge.node,
     SessionRunState.node,

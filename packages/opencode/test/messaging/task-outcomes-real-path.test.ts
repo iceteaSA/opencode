@@ -1142,6 +1142,8 @@ describe("task outcomes: real SessionPrompt and task dispatch", () => {
           const child = (yield* sessions.children(parent.id)).find((item) => item.slug === "outcome-child")
           expect(child).toBeDefined()
           if (!child) return
+          const childUser = (yield* sessions.messages({ sessionID: child.id })).find((message) => message.info.role === "user")
+          expect(childUser?.info.role === "user" && childUser.info.origin).toBe("subagent")
           const notices = yield* pollWithTimeout(
             Effect.map(sessions.messages({ sessionID: parent.id }), (messages) => {
               const notices = messages
@@ -1153,6 +1155,10 @@ describe("task outcomes: real SessionPrompt and task dispatch", () => {
             "5 seconds",
           )
           expect(notices).toHaveLength(1)
+          const parentNotice = (yield* sessions.messages({ sessionID: parent.id })).find((message) =>
+            message.info.role === "user" && message.parts.some((part) => part.type === "text" && part.synthetic && part.text.includes("first answer")),
+          )
+          expect(parentNotice?.info.role === "user" && parentNotice.info.origin).toBe("subagent")
           expect((yield* outcomes.current(child.id))?.last).toMatchObject({
             sequence: 1,
             trigger: "dispatch",

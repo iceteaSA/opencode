@@ -9,6 +9,7 @@ import { MessageV2 } from "./message-v2"
 import { Interrupt } from "./interrupt"
 import { Marker } from "./marker"
 import { Messaging } from "../messaging"
+import { BackgroundJob } from "../background/job"
 import { SessionRevert } from "./revert"
 import { Session } from "./session"
 import { Agent } from "../agent/agent"
@@ -51,7 +52,8 @@ import { Cause, Effect, Exit, Fiber, Latch, Layer, Option, Scope, Context, Schem
 import * as DateTime from "effect/DateTime"
 import { InstanceState } from "@/effect/instance-state"
 import { attach } from "@/effect/run-service"
-import { TaskTool, type TaskPromptOps } from "@/tool/task"
+import { TaskTool, startScheduled, type TaskPromptOps } from "@/tool/task"
+import { ScheduledTaskStore } from "@/tool/scheduled-task-store"
 import { TaskOutcomes } from "@/tool/task-outcomes"
 import { SessionRunState } from "./run-state"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -62,7 +64,8 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { eq } from "drizzle-orm"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { S2SStore } from "@/s2s/store"
-import { decodeCapsuleOption } from "@/s2s/capsule"
+import { S2SDelivery } from "@/s2s/delivery"
+import { S2SFrame } from "@/s2s/frame"
 import { wakeBody } from "@/s2s/wake-registry"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
@@ -135,6 +138,7 @@ export const layer = Layer.effect(
   Effect.gen(function* () {
     const status = yield* SessionStatus.Service
     const sessions = yield* Session.Service
+    const background = yield* BackgroundJob.Service
     const agents = yield* Agent.Service
     const provider = yield* Provider.Service
     const processor = yield* SessionProcessor.Service
@@ -476,6 +480,7 @@ export const layer = Layer.effect(
         sessionID,
         role: "user",
         time: { created: summaryCreated },
+        origin: "system",
         agent: lastUser.agent,
         model: lastUser.model,
       }
@@ -517,6 +522,7 @@ export const layer = Layer.effect(
               time: { created: userCreated },
               role: "user",
               agent: input.agent,
+              origin: "operator",
               model: { providerID: model.providerID, modelID: model.modelID, variant },
             }
             yield* sessions.updateMessage(userMsg)
@@ -726,6 +732,7 @@ export const layer = Layer.effect(
         id: input.messageID ?? MessageID.ascending(Identifier.create("msg", "ascending", created)),
         role: "user",
         sessionID: input.sessionID,
+        origin: input.origin,
         time: { created },
         tools: input.tools,
         agent: ag.name,
@@ -1064,6 +1071,8 @@ export const layer = Layer.effect(
       const resolvedParts = yield* Effect.forEach(input.parts, resolvePart, { concurrency: "unbounded" }).pipe(
         Effect.map((x) => x.flat().map(assign)),
       )
+      // Resolve @mentions first so synthetic context beside human text remains operator input.
+      info.origin ??= Marker.isMachineGeneratedUser(resolvedParts) ? "system" : "operator"
 
       yield* plugin.trigger(
         "chat.message",
@@ -1129,11 +1138,15 @@ export const layer = Layer.effect(
       yield* sessions.touch(input.sessionID)
       // The process that persists a human user message owns its s2s mail;
       // a later loop wake can originate elsewhere and cannot establish ownership.
-      if (flags.experimentalS2S && !Marker.isMachineGeneratedUser(message.parts)) {
+      if (flags.experimentalS2S && (message.info.origin === "operator" || (message.info.origin === undefined && !Marker.isMachineGeneratedUser(message.parts)))) {
         yield* messaging.registerLocal(input.sessionID, message.info.id).pipe(
           Effect.catchCause((cause) =>
             Effect.logWarning("s2s registration failed", { sessionID: input.sessionID, cause: Cause.pretty(cause) }),
           ),
+        )
+        const store = yield* Effect.serviceOption(S2SStore.Service)
+        if (Option.isSome(store)) yield* store.value.heartbeat(input.sessionID, S2SStore.PROCESS_OWNER_ID, Date.now()).pipe(
+          Effect.catchCause((cause) => Effect.logWarning("s2s presence update failed", { sessionID: input.sessionID, cause: Cause.pretty(cause) })),
         )
       }
 
@@ -1165,6 +1178,31 @@ export const layer = Layer.effect(
         let step = 0
         let cancelDeadline: number | undefined
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
+        const scheduled = yield* Effect.serviceOption(ScheduledTaskStore.Service)
+        if (Option.isSome(scheduled)) {
+          const due = yield* scheduled.value.dueForParent(sessionID, Date.now()).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logError("could not load scheduled tasks for parent", { sessionID, cause: Cause.pretty(cause) }).pipe(Effect.as([] as ScheduledTaskStore.Row[])),
+            ),
+          )
+          const promptOps = yield* ops()
+          for (const row of due) {
+            yield* attach(startScheduled(row, promptOps).pipe(
+              Effect.provideService(ScheduledTaskStore.Service, scheduled.value),
+              Effect.provideService(Session.Service, sessions),
+              Effect.provideService(Agent.Service, agents),
+              Effect.provideService(Config.Service, config),
+              Effect.provideService(Permission.Service, permission),
+              Effect.provideService(Messaging.Service, messaging),
+              Effect.provideService(BackgroundJob.Service, background),
+              Effect.provideService(Interrupt.Service, interrupt),
+              Effect.provideService(EventV2Bridge.Service, events),
+              Effect.provideService(TaskOutcomes.Service, outcomes),
+              Effect.provideService(Scope.Scope, scope),
+              Effect.catchCause((cause) => Effect.logError("scheduled task launch failed", { id: row.id, cause: Cause.pretty(cause) })),
+            )).pipe(Effect.forkIn(scope, { startImmediately: true }))
+          }
+        }
 
         while (true) {
           if (!(yield* state.owns(sessionID))) {
@@ -1195,6 +1233,7 @@ export const layer = Layer.effect(
               sessionID,
               role: "user",
               time: { created },
+              origin: "system",
               agent: lastUser.agent,
               model: lastUser.model,
             }
@@ -1249,49 +1288,35 @@ export const layer = Layer.effect(
             (flags.experimentalAgentMessaging || flags.experimentalS2S) &&
             !(Option.isSome(pendingInterrupt) && pendingInterrupt.value.intent === "cancel")
           ) {
-            // D — s2s drain: atomically claim s2s_inbox rows for THIS session
-            // and enqueue into the in-process inbox so the drain below picks them
-            // up. serviceOption keeps S2SStore out of the static layer requirement.
-            // This drain runs inside the active turn's lease, unlike the idle poller.
+            // This lease owner admits canonical mail before coordinator inbox items;
+            // serviceOption keeps S2SStore out of the static layer requirement.
             if (flags.experimentalS2S) {
-              yield* Effect.suspend(() =>
+              const receivingUser = lastUser
+              const delivered = yield* Effect.suspend(() =>
                 Effect.gen(function* () {
                   const storeOpt = yield* Effect.serviceOption(S2SStore.Service)
-                  if (Option.isNone(storeOpt)) return
-                  const dbOpt = yield* Effect.serviceOption(Database.Service)
-                  if (Option.isNone(dbOpt)) return
-                  const s2sRows = yield* storeOpt.value.claimForSessions([sessionID]).pipe(
-                    Effect.provideService(Database.Service, dbOpt.value),
-                  )
-                  for (const row of s2sRows) {
-                    const cap = decodeCapsuleOption(row.capsule)
-                    // Leave a malformed row claimed (drained_at set) — matches
-                    // S2SPoller.processRow; it is never deliverable.
-                    if (Option.isNone(cap)) continue
-                    // Mirror S2SPoller.processRow's attribution EXACTLY so the
-                    // same message shows identical framing whether it arrives
-                    // via this in-loop drain or the C′ poller: authoritative DB
-                    // columns (from_session_id / from_slug) for the address,
-                    // capsule sender_name for the display label (slug fallback).
-                    yield* messaging.enqueue({
-                      target: row.targetSessionID,
-                      from: row.fromSessionID ?? row.targetSessionID,
-                      fromSlug: row.fromSlug ?? "unknown",
-                      fromName: cap.value.sender_name ?? row.fromSlug ?? "unknown",
-                      body: cap.value.body,
-                      source: "sibling-session",
-                      inboxId: row.id,
-                      sent: cap.value.timestamp,
-                    })
-                    // Delivered into the in-process inbox — hard-delete the row
-                    // so the 60s reaper never redelivers an already-delivered
-                    // message (enqueue-then-delete: a failed enqueue throws
-                    // before this and leaves the row claimed for reaper retry,
-                    // so no message is lost).
-                    yield* storeOpt.value.deleteInbox(row.id).pipe(Effect.provideService(Database.Service, dbOpt.value))
+                  if (Option.isNone(storeOpt)) return 0
+                  // Only this lease owner adopts legacy ingress; the canonical id is never put back into the old poller's inbox.
+                  for (const row of yield* storeOpt.value.pendingLegacyForSession(sessionID)) {
+                    yield* storeOpt.value.adoptLegacy(row.id)
                   }
-                }).pipe(Effect.catch((e) => Effect.logWarning("s2s drain failed", e))),
+                  const expired = yield* storeOpt.value.resolvePendingForSession(sessionID, Date.now())
+                  let count = 0
+                  for (const row of yield* storeOpt.value.pendingForSession(sessionID, Date.now())) {
+                     if (yield* S2SDelivery.admit(row, receivingUser, sessions, expired).pipe(
+                      Effect.provideService(S2SStore.Service, storeOpt.value),
+                      Effect.provideService(EventV2Bridge.Service, events),
+                    )) count++
+                  }
+                  if (yield* S2SDelivery.summarizeExpired(sessionID, [...new Set(expired)].toSorted(), receivingUser, sessions)) count++
+                  return count
+                }).pipe(Effect.catch((e) => Effect.logWarning("s2s drain failed", e).pipe(Effect.as(0)))),
               )
+              if (delivered) {
+                msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(Effect.provideService(Database.Service, database))
+                ;({ user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs))
+                if (!lastUser) throw new Error("No user message after s2s receipt.")
+              }
             }
 
             const inboxItems = yield* messaging.drain(sessionID)
@@ -1302,30 +1327,21 @@ export const layer = Layer.effect(
                 sessionID,
                 role: "user",
                 time: { created },
+                // A mixed drain stays one transcript message; each marker retains its sender source.
+                origin: inboxItems.every((item) => item.source === inboxItems[0]?.source)
+                  ? inboxItems[0]?.source === "sibling-session" ? "s2s" : "peer"
+                  : "mixed",
                 agent: lastUser.agent,
                 model: lastUser.model,
               }
               yield* sessions.updateMessage(inboxMsg)
               for (const item of inboxItems) {
-                // 1) synthetic frame the model reads. Sibling-session items
-                //    (source="sibling-session", i.e. read from the s2s_inbox
-                //    table by the poller, or an in-process s2s send) get a
-                //    richer <external-context> frame addressed by the sender's
-                //    SESSION ID (so the recipient can message back) plus a
-                //    human-readable session name; the in-process coordinator-
-                //    messaging path keeps the lighter <agent_message> wrapper
-                //    addressed by the parent-owned slug. Attribute VALUES use
-                //    Marker.escapeAttr (escapes " ' on top of &<>) so a peer's
-                //    session title or id cannot close the attribute and inject
-                //    sibling attributes; element CONTENT (the body) uses
-                //    Marker.escape. Together a malicious peer can neither break
-                //    out of an attribute nor close the frame early.
-                //    s2s name falls back to the slug for pre-sender_name capsules.
-                const s2sName = item.fromName ?? item.fromSlug
+                // Older in-flight sibling messages must render exactly like canonical receipts.
+                const sibling = item.source === "sibling-session"
+                  ? S2SFrame.render({ name: item.fromName ?? item.fromSlug, sessionID: String(item.from), time: item.time, sent: item.sent ?? item.time, body: item.body })
+                  : undefined
                 const frameText =
-                  item.source === "sibling-session"
-                    ? `<external-context source="sibling-session" name="${Marker.escapeAttr(s2sName)}" session="${Marker.escapeAttr(String(item.from))}" time="${item.time}" sent="${Marker.escapeAttr(new Date(item.sent ?? item.time).toISOString())}">\n${Marker.escape(item.body)}\n</external-context>`
-                    : `<agent_message from="${Marker.escapeAttr(item.fromSlug)}">\n${Marker.escape(item.body)}\n</agent_message>`
+                  sibling?.frame ?? `<agent_message from="${Marker.escapeAttr(item.fromSlug)}">\n${Marker.escape(item.body)}\n</agent_message>`
                 yield* sessions.updatePart({
                   id: PartID.ascending(),
                   messageID: inboxMsg.id,
@@ -1334,20 +1350,15 @@ export const layer = Layer.effect(
                   text: frameText,
                   synthetic: true,
                 } satisfies SessionV1.TextPart)
-                // 2) non-synthetic visible ✉ marker. s2s shows the session name
-                //    + addressable session id; coordinator-messaging shows the slug.
-                const markerInput =
-                  item.source === "sibling-session"
-                    ? ({ kind: "inbox", from: s2sName, sessionId: String(item.from) } as const)
-                    : ({ kind: "inbox", from: item.fromSlug } as const)
+                const markerInput = { kind: "inbox", from: item.fromSlug } as const
                 yield* sessions.updatePart({
                   id: PartID.ascending(),
                   messageID: inboxMsg.id,
                   sessionID,
                   type: "text",
-                  text: Marker.render({ ...markerInput, body: item.body }),
+                  text: sibling?.marker ?? Marker.render({ ...markerInput, body: item.body }),
                   synthetic: false,
-                  metadata: Marker.metadataFor(markerInput),
+                  metadata: sibling?.metadata ?? Marker.metadataFor(markerInput),
                 } satisfies SessionV1.TextPart)
               }
               msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
@@ -1968,6 +1979,7 @@ export const PromptInput = Schema.Struct({
   model: Schema.optional(ModelRef),
   agent: Schema.optional(Schema.String),
   noReply: Schema.optional(Schema.Boolean),
+  origin: Schema.optional(SessionV1.User.fields.origin),
   tools: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)).annotate({
     description:
       "@deprecated tools and permissions have been merged, you can set permissions on the session itself now",
@@ -2067,6 +2079,7 @@ export const node = LayerNode.make({
   deps: [
     SessionStatus.node,
     Session.node,
+    BackgroundJob.node,
     Agent.node,
     Provider.node,
     SessionProcessor.node,

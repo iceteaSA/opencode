@@ -324,6 +324,7 @@ export const writeMarker = (
       sessionID: input.sessionID,
       role: "user",
       time: { created },
+      origin: input.peer === "parent" ? "peer" : "subagent",
       agent: lastUser.agent,
       model: lastUser.model,
     }

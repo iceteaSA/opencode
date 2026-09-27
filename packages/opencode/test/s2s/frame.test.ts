@@ -22,6 +22,7 @@
 import { EffectFlock } from '@opencode-ai/core/util/effect-flock';
 import { afterEach, describe, expect } from "bun:test"
 import { Effect, Layer } from "effect"
+import { sql } from "drizzle-orm"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { NodeFileSystem } from "@effect/platform-node"
 import { FetchHttpClient } from "effect/unstable/http"
@@ -66,6 +67,7 @@ import { Skill } from "@/skill"
 import { Snapshot } from "@/snapshot"
 import { SystemPrompt } from "@/session/system"
 import { S2SStore } from '../../src/s2s/store';
+import { encodeCapsule } from "../../src/s2s/capsule"
 import { SessionID } from "../../src/session/schema"
 import { Todo } from "@/session/todo"
 import { ToolRegistry } from "@/tool/registry"
@@ -165,8 +167,8 @@ const providerCfgFor = (url: string): Partial<ConfigV1.Info> => ({
   },
 })
 
-function makeRunLoopLayer() {
-  const flags = RuntimeFlags.layer({ experimentalEventSystem: true, experimentalAgentMessaging: true })
+function makeRunLoopLayer(experimentalS2S = false) {
+  const flags = RuntimeFlags.layer({ experimentalEventSystem: true, experimentalAgentMessaging: true, experimentalS2S })
   const root = LayerNode.group([
     Session.node,
     SessionProjector.node,
@@ -218,6 +220,7 @@ function makeRunLoopLayer() {
 
 const spikeLayer = Layer.mergeAll(TestLLMServer.layer, makeRunLoopLayer())
 const it = testEffectIsolatedShared(spikeLayer as unknown as Layer.Layer<any, any, never>)
+const s2sIt = testEffectIsolatedShared(Layer.mergeAll(TestLLMServer.layer, makeRunLoopLayer(true)) as unknown as Layer.Layer<any, any, never>)
 
 const useServerConfig = Effect.fn("FrameTest.useServerConfig")(function* (
   config: (url: string) => Partial<ConfigV1.Info>,
@@ -253,6 +256,83 @@ const seedIdleSessionWithWarmup = Effect.fn("FrameTest.seedIdleSessionWithWarmup
   yield* llm.text("warm-up-reply")
   return { chat, llm }
 })
+
+s2sIt.instance("run-loop receipt persists canonical mail before the next provider turn", () =>
+  Effect.gen(function* () {
+    const { chat, llm } = yield* seedIdleSessionWithWarmup()
+    const { db } = yield* Database.Service
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const id = "inb_frame_canonical"
+    yield* db.run(sql`
+      INSERT INTO s2s_message (id, target_session_id, from_session_id, from_slug, capsule, sent_at)
+      VALUES (${id}, ${chat.id}, 'ses_frame_sender', 'sender', ${encodeCapsule({ version: 1, id, sender_slug: "sender", sender_session_id: "ses_frame_sender", timestamp: 1, body: "canonical body" })}, 1)
+    `)
+    yield* prompt.loop({ sessionID: chat.id })
+    const receipts = (yield* sessions.messages({ sessionID: chat.id })).filter((message) => message.info.role === "user" && message.info.origin === "s2s")
+    expect(receipts).toHaveLength(1)
+    expect(receipts[0]?.parts).toHaveLength(2)
+    expect(receipts[0]?.parts.some((part) => part.type === "text" && part.synthetic && part.text.includes("canonical body"))).toBe(true)
+    expect(yield* db.get(sql`SELECT transcript_message_id FROM s2s_message WHERE id = ${id} AND delivered_at IS NOT NULL`)).toEqual({ transcript_message_id: receipts[0]?.info.id })
+    yield* llm.reset
+  }),
+  30000,
+)
+
+s2sIt.instance("run-loop emits one expiration notice and never admits the expired instruction", () =>
+  Effect.gen(function* () {
+    const { chat, llm } = yield* seedIdleSessionWithWarmup()
+    const { db } = yield* Database.Service
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    for (const id of ["inb_frame_expired_a", "inb_frame_expired_b"]) {
+      yield* db.run(sql`
+        INSERT INTO s2s_message (id, target_session_id, from_session_id, from_slug, capsule, sent_at, expires_at)
+        VALUES (${id}, ${chat.id}, 'ses_frame_sender', 'sender', ${encodeCapsule({ version: 1, id, sender_slug: "sender", sender_session_id: "ses_frame_sender", timestamp: 1, body: `EXPIRED-ORIGINAL-${id}` })}, 1, ${Date.now() - 1})
+      `)
+    }
+    yield* prompt.loop({ sessionID: chat.id })
+    const notices = (yield* sessions.messages({ sessionID: chat.id })).filter((message) => message.info.role === "user" && message.info.origin === "s2s")
+    expect(notices).toHaveLength(1)
+    expect(notices[0]?.parts).toHaveLength(1)
+    expect(JSON.stringify(notices)).toContain("2 expired")
+    expect(JSON.stringify(notices)).not.toContain("EXPIRED-ORIGINAL")
+    expect(yield* db.get(sql`SELECT count(*) AS count FROM s2s_message WHERE target_session_id = ${chat.id} AND expired_at IS NOT NULL AND delivered_at IS NULL`)).toEqual({ count: 2 })
+    yield* llm.reset
+  }),
+  30000,
+)
+
+it.instance("projects uniform and mixed inbox origins while retaining each part's source", () =>
+  Effect.gen(function* () {
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const messaging = yield* Messaging.Service
+    const peerSession = SessionID.make("ses_origin_peerxxxxxxxxxxx")
+    for (const sources of [["sibling-session"], [undefined], ["sibling-session", undefined]] as const) {
+      const { chat } = yield* seedIdleSessionWithWarmup()
+      for (const [index, source] of sources.entries()) {
+        yield* messaging.enqueue({
+          target: chat.id,
+          from: peerSession,
+          fromSlug: `peer${index}`,
+          body: `body${index}`,
+          ...(source ? { source } : {}),
+        })
+      }
+      yield* prompt.loop({ sessionID: chat.id })
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const inbox = messages.findLast((message) => message.parts.some((part) => part.type === "text" && part.metadata?.marker?.kind === "inbox"))
+      expect(inbox?.info.role).toBe("user")
+      if (inbox?.info.role !== "user") continue
+      expect(inbox.info.origin).toBe(sources.length > 1 ? "mixed" : sources[0] ? "s2s" : "peer")
+      const markers = inbox.parts.filter((part) => part.type === "text" && part.metadata?.marker?.kind === "inbox")
+      expect(markers).toHaveLength(sources.length)
+      expect(markers.map((part) => part.type === "text" && "sessionId" in (part.metadata?.marker ?? {}))).toEqual(sources.map(Boolean))
+    }
+  }),
+  90000,
+)
 
 describe("s2s frame: cross-session <external-context> in the drain (Task 6)", () => {
   it.instance(

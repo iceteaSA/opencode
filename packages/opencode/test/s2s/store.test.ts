@@ -15,14 +15,17 @@
 // therefore the same set of migrations).
 
 import { describe, expect } from "bun:test"
+import { sql } from "drizzle-orm"
 import { Effect, Layer, Option } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
 import { S2SStore } from "../../src/s2s/store"
 import { SessionID } from "../../src/session/schema"
 import { testEffect } from "../lib/effect"
+import { claimLegacy } from './fixtures/legacy-claim';
+import { countUndelivered } from './fixtures/undelivered-count';
 
 const database = Database.layerFromPath(":memory:")
-const it = testEffect(S2SStore.layer.pipe(Layer.provide(database)))
+const it = testEffect(S2SStore.layer.pipe(Layer.provideMerge(database)))
 
 // Two valid arbitrary session ids for table-row targets.
 const S1 = SessionID.make("ses_target_alpha")
@@ -45,13 +48,13 @@ describe("S2SStore", () => {
         ],
         (row) => store.insertInbox({ ...row, fromSessionID: INVITER, fromSlug: "peer", capsule: "x", timeCreated: 1 }),
       )
-      yield* store.claimForSessions([S2])
+      yield* claimLegacy([S2])
 
       expect(yield* store.pendingTargets([S1, S2])).toEqual([S1])
       expect(yield* store.pendingTargets([])).toEqual([])
     }),
   )
-  it.effect("claimForSessions drains and de-duplicates a row", () =>
+  it.effect("adoptLegacy moves one pending id into the canonical queue", () =>
     Effect.gen(function* () {
       const store = yield* S2SStore.Service
 
@@ -64,20 +67,15 @@ describe("S2SStore", () => {
         timeCreated: 1_700_000_000_000,
       })
 
-      const first = yield* store.claimForSessions([S1])
-      expect(first).toHaveLength(1)
-      expect(first[0]?.id).toBe("inb_1")
-      expect(first[0]?.targetSessionID).toBe(S1)
-      expect(first[0]?.fromSessionID).toBe(INVITER)
-      expect(first[0]?.fromSlug).toBe("inviter")
-      expect(first[0]?.capsule).toBe('{"body":"hi"}')
-
-      const second = yield* store.claimForSessions([S1])
-      expect(second).toEqual([])
+      expect((yield* store.pendingLegacyForSession(S1)).map((row) => row.id)).toContain("inb_1")
+      const first = yield* store.adoptLegacy("inb_1")
+      expect(first).toMatchObject({ id: "inb_1", targetSessionID: S1, fromSessionID: INVITER, fromSlug: "inviter", capsule: '{"body":"hi"}' })
+      expect(yield* store.adoptLegacy("inb_1")).toBeUndefined()
+      expect((yield* store.pendingForSession(S1, Date.now())).map((row) => row.id)).toContain("inb_1")
     }),
   )
 
-  it.effect("claimForSessions scopes rows to the requested session ids", () =>
+  it.effect("pendingLegacyForSession scopes legacy rows to the recipient", () =>
     Effect.gen(function* () {
       const store = yield* S2SStore.Service
 
@@ -90,13 +88,8 @@ describe("S2SStore", () => {
         timeCreated: 1,
       })
 
-      // Ask for a different session — the row targeted at S1 must NOT come back.
-      const drained = yield* store.claimForSessions([S2])
-      expect(drained).toEqual([])
-
-      // Original target still gets it.
-      const first = yield* store.claimForSessions([S1])
-      expect(first.map((r) => r.id)).toEqual(["inb_scoped"])
+      expect((yield* store.pendingLegacyForSession(S2)).map((row) => row.id)).not.toContain("inb_scoped")
+      expect((yield* store.pendingLegacyForSession(S1)).map((row) => row.id)).toContain("inb_scoped")
     }),
   )
 
@@ -113,11 +106,11 @@ describe("S2SStore", () => {
         timeCreated: 1,
       })
 
-      const claimed = yield* store.claimForSessions([S1])
+      const claimed = yield* claimLegacy([S1])
       expect(claimed).toHaveLength(1)
 
       // Immediately after, the claim is held — nothing to drain.
-      const stillHeld = yield* store.claimForSessions([S1])
+      const stillHeld = yield* claimLegacy([S1])
       expect(stillHeld).toEqual([])
 
       // Reap everything older than now+1s. The previous claim's drained_at
@@ -125,14 +118,15 @@ describe("S2SStore", () => {
       // captures it and reopens the row.
       yield* store.reapStale(Date.now() + 1_000)
 
-      const reclaimed = yield* store.claimForSessions([S1])
+      const reclaimed = yield* claimLegacy([S1])
       expect(reclaimed.map((r) => r.id)).toEqual(["inb_stale"])
     }),
   )
 
-  it.effect("a delivered (deleteInbox'd) row is NOT redelivered by reapStale", () =>
+  it.effect("a deleted legacy row is NOT redelivered by reapStale", () =>
     Effect.gen(function* () {
       const store = yield* S2SStore.Service
+      const { db } = yield* Database.Service
 
       yield* store.insertInbox({
         id: "inb_delivered",
@@ -143,21 +137,18 @@ describe("S2SStore", () => {
         timeCreated: 1,
       })
 
-      // Claim (delivered into the in-process inbox) then hard-delete — the
-      // exact poller/D-drain sequence after a successful enqueue.
-      const claimed = yield* store.claimForSessions([S1])
+      // An older process could delete its own completed legacy claim before the new owner adopts it.
+      const claimed = yield* claimLegacy([S1])
       expect(claimed.map((r) => r.id)).toEqual(["inb_delivered"])
-      yield* store.deleteInbox("inb_delivered")
+      yield* db.run(sql`DELETE FROM s2s_inbox WHERE id = 'inb_delivered'`)
 
-      // Reaper runs far in the future. Before the deleteInbox fix this reset
-      // the delivered row's drained_at to NULL and redelivered it forever;
-      // now the row is gone, so the reaper has nothing to resurrect.
+      // The reaper must not resurrect a completed legacy claim.
       yield* store.reapStale(Date.now() + 1_000_000)
-      const afterReap = yield* store.claimForSessions([S1])
+      const afterReap = yield* claimLegacy([S1])
       expect(afterReap).toEqual([])
 
-      // countUndelivered also reflects the delete (durable INBOX_CAP basis).
-      expect(yield* store.countUndelivered(S1)).toBe(0)
+      // The shared sender cap also reflects the legacy deletion.
+      expect(yield* countUndelivered(S1)).toBe(0)
     }),
   )
 
@@ -174,11 +165,10 @@ describe("S2SStore", () => {
         timeCreated: 1,
       })
 
-      // Claim but DO NOT delete — simulates a delivering fiber that died
-      // between claim and deleteInbox. The reaper must reopen this one.
-      yield* store.claimForSessions([S2])
+      // An old process that crashes after claiming leaves a row for the new owner to adopt.
+      yield* claimLegacy([S2])
       yield* store.reapStale(Date.now() + 1_000_000)
-      const reclaimed = yield* store.claimForSessions([S2])
+      const reclaimed = yield* claimLegacy([S2])
       expect(reclaimed.map((r) => r.id)).toEqual(["inb_crashed"])
     }),
   )
@@ -247,6 +237,31 @@ describe("S2SStore", () => {
 
       yield* store.deleteAllow(S1, S2)
       expect(yield* store.isAllowed(S1, S2)).toBe(false)
+    }),
+  )
+
+  it.effect("the cap and visible count include the same pending canonical and undrained legacy rows", () =>
+    Effect.gen(function* () {
+      const store = yield* S2SStore.Service
+      const { db } = yield* Database.Service
+      const recipient = SessionID.make("ses_cap_parity_target")
+      const sender = SessionID.make("ses_cap_parity_sender")
+      yield* db.run(sql`PRAGMA foreign_keys = OFF`)
+      yield* db.run(sql`INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES (${recipient}, 'prj_cap', 'cap-target', '/tmp', 'Recipient', '1', 1, 1), (${sender}, 'prj_cap', 'cap-sender', '/tmp', 'Sender', '1', 1, 1)`)
+      yield* db.run(sql`PRAGMA foreign_keys = ON`)
+      yield* store.insertInbox({ id: "inb_cap_legacy", targetSessionID: recipient, fromSessionID: sender, fromSlug: "sender", capsule: "{}", timeCreated: 1 })
+      const send = (id: string) => store.tryEnqueueWithDedup({
+        dedupeKey: `key_${id}`, sender, target: recipient, fromSlug: "sender", capsule: "{}",
+        capsuleId: id, timeCreated: Date.now(), windowMs: 600_000, inboxCap: 2,
+      })
+      expect(yield* countUndelivered(recipient)).toBe(1)
+      expect((yield* send("caps_cap_first"))._tag).toBe("inserted")
+      expect(yield* countUndelivered(recipient)).toBe(2)
+      expect((yield* send("caps_cap_second"))._tag).toBe("inbox_full")
+      yield* claimLegacy([recipient])
+      expect(yield* countUndelivered(recipient)).toBe(1)
+      expect((yield* send("caps_cap_second"))._tag).toBe("inserted")
+      expect(yield* countUndelivered(recipient)).toBe(2)
     }),
   )
 })

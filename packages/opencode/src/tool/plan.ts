@@ -57,6 +57,7 @@ export const PlanExitTool = Tool.define(
             sessionID: ctx.sessionID,
             role: "user",
             time: { created },
+            origin: "system",
             agent: "build",
             model,
           }

@@ -49,6 +49,7 @@ import { TestInstance } from "../fixture/fixture"
 import { testEffectIsolatedShared } from "../lib/effect"
 import { TestLLMServer } from "../lib/llm-server"
 import { TaskOutcomes } from "../../src/tool/task-outcomes"
+import { ScheduledTaskStore } from "../../src/tool/scheduled-task-store"
 
 const summaryStub = Layer.succeed(
   SessionSummary.Service,
@@ -169,6 +170,7 @@ function makeRunLoopLayer() {
     FSUtil.node,
     BackgroundJob.node,
     TaskOutcomes.node,
+    ScheduledTaskStore.node,
     Database.node,
     EventV2Bridge.node,
     Interrupt.node,

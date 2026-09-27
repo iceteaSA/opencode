@@ -15,6 +15,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { S2SStore, isRetryableSqlError, retryOnBusy } from "../../src/s2s/store"
 import { SessionID } from "../../src/session/schema"
 import { testEffect } from "../lib/effect"
+import { claimLegacy } from './fixtures/legacy-claim';
 
 // ──────────────────────────────────────────────────────────────────
 // Helpers — synthesize the exact error chain the store sees at runtime
@@ -187,7 +188,7 @@ describe("S2SStore.deleteOrphaned", () => {
       yield* store.deleteOrphaned()
 
       // Verify: ONLY orphan rows are gone
-      const inbox = yield* store.claimForSessions([LIVE, ORPHAN])
+      const inbox = yield* claimLegacy([LIVE, ORPHAN])
       const inboxIds = inbox.map((r) => r.id)
       expect(inboxIds).toContain("inb_live")
       expect(inboxIds).not.toContain("inb_orphan")

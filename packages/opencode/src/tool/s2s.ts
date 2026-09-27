@@ -1,51 +1,9 @@
-// Session-to-Session — Task 7 (the s2s tool).
-//
-// This is the user-facing primitive for cross-session messaging between
-// two SEPARATE top-level opencode sessions (siblings, not parent/child
-// subagents — that path stays on the existing `message` tool). The two
-// sessions live in the same machine (the s2s_inbox table is a per-host
-// SQLite file) and must opt in to each other via an `invite` / `accept`
-// token handshake before they can exchange messages.
-//
-// Commands:
-//   - invite           — mint a single-use token bound to this session.
-//   - accept <token>   — consume a peer's token; writes both allow
-//                        directions in the durable consent record.
-//   - msg <session-id> <body> — send a body to an allow-listed peer
-//                        (addressed by the peer's globally-unique
-//                        session_id); goes in-process when the peer is
-//                        local and persists to s2s_inbox otherwise.
-//   - list             — list paired peers and consent direction.
-//   - leave <session-id> — revoke the allow for a peer (both directions).
-//
-// Addressing is by SESSION_ID, not slug: session.slug is NOT unique
-// (Slug.create is a random adjective-noun pair and starts empty until a
-// title is generated), so a slug cannot address a peer. The durable
-// s2s_allow table is session_id based and is the consent authority. The
-// subagent `message` tool keeps slug addressing — a parent owns its
-// children's slug namespace and guarantees uniqueness there.
-//   - relay [id?]      — emit a capsule as a copy-pasteable JSON blob
-//                        (zero-infra fallback; v1 just returns the body
-//                        in capsule shape so a future Task 8+
-//                        cross-machine version can pick it up).
-//
-// Dependencies are intentionally narrow: S2SStore + Messaging + Session.
-// The tool does NOT depend on SessionPrompt — the recipient wake is the
-// poller's job, not the sender's (memory-#213 cycle rule: any tool in
-// ToolRegistry must not require SessionPrompt).
-//
-// The cross-process path (`msg` to a non-local peer) goes through the
-// module-local `enqueueExternal` helper, NOT through Messaging's
-// Interface. Putting enqueueExternal on Messaging would have made
-// Messaging.layer require S2SStore in its R, which broke a wave of
-// existing tests that compose Messaging.layer without S2SStore
-// (the `it.instance` harness from `test/lib/effect.ts` layers the
-// test body over the merged layer, and a missing S2SStore in the
-// merged layer's R surfaced as "Service not found" at the first
-// `yield*`). The standalone helper keeps the dependency local.
+// S2S addresses globally unique session IDs, not collision-prone slugs.
+// Every send, including a same-process send, first commits one canonical
+// s2s_message row; waking the recipient never substitutes for durability.
 
 import { isLocalForLatestUser } from "@/s2s/local-owner"
-import { Effect, Option, Schema } from "effect"
+import { Cause, Effect, Exit, Option, Schema } from "effect"
 import * as Tool from "./tool"
 import { Messaging, AbuseError, INBOX_CAP, S2S_HOURLY_OUTBOUND_CAP } from "../messaging"
 import { Session } from "@/session/session"
@@ -53,27 +11,44 @@ import { S2SStore, TOKEN_TTL_MS, DEDUPE_WINDOW_MS } from "@/s2s/store"
 import { S2SCapsule, encodeCapsule } from "@/s2s/capsule"
 import { uuidv7 } from "@/s2s/uuidv7"
 import { SessionID } from "@/session/schema"
+import { parseInstant } from "./iso-instant"
 import DESCRIPTION from "./s2s.txt"
 
 const MAX_BODY_LENGTH = 16000
+const MAX_FANOUT = 20
 
 export const Parameters = Schema.Struct({
-  command: Schema.Literals(["invite", "accept", "msg", "list", "leave", "relay"]).annotate({
+  command: Schema.Literals(["invite", "accept", "msg", "sent", "list", "leave", "relay"]).annotate({
     description: "Which s2s subcommand to run",
   }),
   // For `msg` and `leave` the user supplies the peer's session_id. For
-  // `msg` the body is also required. For `invite`/`accept`/`list`/`relay` the
+  // `msg` the body is also required. `sent` may filter on target; the
   // other args are unused. Each is optional at the schema level so a
   // partial call decodes; the tool's run function rejects shape
   // mismatches per-command with a precise error.
   target: Schema.optional(Schema.String).annotate({
-    description: "For msg/leave: the peer's session_id (ses_...) to address",
+    description: "For msg/leave: peer session_id; for sent: optional peer filter",
+  }),
+  targets: Schema.optional(Schema.Array(Schema.String)).annotate({
+    description: "For msg: multiple peer session_ids, instead of target",
   }),
   token: Schema.optional(Schema.String).annotate({
     description: "For accept: the one-shot token shared by the inviter",
   }),
   body: Schema.optional(Schema.String).annotate({
     description: "For msg: the message body",
+  }),
+  expires_at: Schema.optional(Schema.String).annotate({
+    description: "For msg: expire an undelivered message at this timezone-qualified ISO instant",
+  }),
+  deliver_at: Schema.optional(Schema.String).annotate({
+    description: "For msg: start delivery at this timezone-qualified ISO instant",
+  }),
+  stagger_ms: Schema.optional(Schema.Number).annotate({
+    description: "For msg with targets: offset each target by this many milliseconds",
+  }),
+  supersedes: Schema.optional(Schema.String).annotate({
+    description: "For msg: retract an undelivered earlier message to the same peer from this sender",
   }),
 })
 
@@ -83,13 +58,23 @@ type Peer = {
   established_at: number
   outbound: boolean
   inbound: boolean
+  activity: "running" | "unknown"
 }
+
+type SendResult =
+  | { target: string; status: "sent"; id: string; due_at: string; peer: "current" | "unknown"; supersession?: "superseded" | "already_delivered" | "in_delivery" }
+  | { target: string; status: "duplicate"; id: string; due_at: string }
+  | { target: string; status: "failed"; due_at: string; reason: string }
 
 type Metadata = {
   command: string
   target?: string
   peers?: Peer[]
+  history?: S2SStore.SentRow[]
   allowance?: ReturnType<typeof outboundAllowance>
+  supersession?: "superseded" | "already_delivered" | "in_delivery"
+  due_at?: string
+  results?: SendResult[]
 }
 
 export const S2STool = Tool.define<typeof Parameters, Metadata, Messaging.Service | Session.Service | S2SStore.Service>(
@@ -163,13 +148,82 @@ export const S2STool = Tool.define<typeof Parameters, Metadata, Messaging.Servic
         }
 
         case "msg": {
-          if (!params.target)
-            return yield* Effect.fail(new Error('s2s(command:"msg") requires target=<peer-session-id>'))
-          if (!params.body) return yield* Effect.fail(new Error('s2s(command:"msg") requires body="..."'))
-          if (params.body.length > MAX_BODY_LENGTH)
+          const batched = params.targets !== undefined
+          if (Boolean(params.target) === batched)
+            return yield* Effect.fail(new Error('s2s(command:"msg") requires exactly one of target or nonempty targets'))
+          if (batched && (params.targets.length === 0 || params.targets.length > MAX_FANOUT))
+            return yield* Effect.fail(new Error(`s2s targets must contain 1–${MAX_FANOUT} peers`))
+          if (params.stagger_ms !== undefined && (!batched || !Number.isSafeInteger(params.stagger_ms) || params.stagger_ms < 0))
+            return yield* Effect.fail(new Error("s2s stagger_ms requires targets and a nonnegative integer"))
+          const body = params.body
+          if (!body) return yield* Effect.fail(new Error('s2s(command:"msg") requires body="..."'))
+          if (body.length > MAX_BODY_LENGTH)
             return yield* Effect.fail(
-              new Error(`s2s body exceeds maximum length of ${MAX_BODY_LENGTH} characters (got ${params.body.length})`),
+              new Error(`s2s body exceeds maximum length of ${MAX_BODY_LENGTH} characters (got ${body.length})`),
             )
+          const expiresAt = params.expires_at ? parseInstant(params.expires_at) : undefined
+          if (params.expires_at && expiresAt === undefined)
+            return yield* Effect.fail(new Error("s2s expires_at must be a timezone-qualified ISO-8601 instant"))
+          const deliverAt = params.deliver_at ? parseInstant(params.deliver_at) : undefined
+          if (params.deliver_at && deliverAt === undefined)
+            return yield* Effect.fail(new Error("s2s deliver_at must be a timezone-qualified ISO-8601 instant"))
+          if (params.supersedes === "") return yield* Effect.fail(new Error("s2s supersedes requires a message id"))
+          const baseDue = deliverAt ?? Date.now()
+          if (batched && !Number.isFinite(new Date(baseDue + (params.targets.length - 1) * (params.stagger_ms ?? 0)).getTime()))
+            return yield* Effect.fail(new Error("s2s staggered deliver_at exceeds the supported time range"))
+
+          const capsuleFor = (due?: number): S2SCapsule => ({
+            version: 1,
+            id: uuidv7(),
+            sender_slug: me.slug,
+            sender_name: me.title,
+            sender_session_id: String(ctx.sessionID),
+            timestamp: Date.now(),
+            expires_at: params.expires_at,
+            deliver_at: due === undefined ? undefined : new Date(due).toISOString(),
+            supersedes: params.supersedes,
+            body,
+          })
+
+          if (batched) {
+            const results = yield* Effect.forEach(params.targets, (target, index) => Effect.gen(function* () {
+              const due = baseDue + index * (params.stagger_ms ?? 0)
+              const due_at = new Date(due).toISOString()
+              if (target === ctx.sessionID) return { target, due_at, status: "failed" as const, reason: "cannot send to self" }
+              if (expiresAt !== undefined && expiresAt <= due) return { target, due_at, status: "failed" as const, reason: "expires_at must be after this target's deliver_at" }
+              const peer = SessionID.make(target)
+              if (!(yield* store.isAllowed(ctx.sessionID, peer))) return { target, due_at, status: "failed" as const, reason: "target is not in your s2s allow list" }
+              const presence = yield* store.peerCapability(peer, Date.now())
+              if (presence.state === "incompatible") return { target, due_at, status: "failed" as const, reason: `Recipient is running an incompatible S2S build (capability ${presence.version}); upgrade it and retry.` }
+              const capsule = capsuleFor(due)
+              const attempted = yield* enqueueExternal({
+                store,
+                target: peer,
+                fromSlug: me.slug,
+                capsule,
+                expiresAt,
+                deliverAt: due,
+                supersedes: params.supersedes,
+                scheduleKey: params.deliver_at ? `at:${due}` : `stagger:${params.stagger_ms ?? 0}:${index}`,
+              }).pipe(Effect.exit)
+              if (Exit.isFailure(attempted)) {
+                const error = Cause.findErrorOption(attempted.cause)
+                return { target, due_at, status: "failed" as const, reason: Option.isSome(error) && error.value instanceof AbuseError ? error.value.detail : "Store admission failed; retry this target." }
+              }
+              const outcome = attempted.value
+              if (outcome._tag === "invalid_supersedes") return { target, due_at, status: "failed" as const, reason: "supersedes id must be a pending message from this sender to this recipient" }
+              if (outcome._tag === "duplicate") return { target, due_at: new Date(outcome.originalDueAt).toISOString(), status: "duplicate" as const, id: outcome.originalInboxId }
+              return { target, due_at, status: "sent" as const, id: outcome.inboxId, peer: presence.state, supersession: outcome.supersession }
+            }), { concurrency: 1 })
+            return {
+              title: "S2S staggered fan-out",
+              metadata: { command: "msg", results, allowance: outboundAllowance(ctx.sessionID) },
+              output: results.map((result) => `${result.target} · ${result.status}${"id" in result ? ` id=${result.id}` : ""} · due ${result.due_at}${"reason" in result ? ` · ${result.reason}` : ""}`).join("\n"),
+            }
+          }
+          if (!params.target) return yield* Effect.fail(new Error('s2s(command:"msg") requires target=<peer-session-id>'))
+          if (expiresAt !== undefined && expiresAt <= baseDue)
+            return yield* Effect.fail(new Error("s2s expires_at must be after deliver_at"))
 
           // Addressing is by session_id. The target string IS the peer's
           // SessionID — no slug resolution (session.slug is not unique).
@@ -187,56 +241,39 @@ export const S2STool = Tool.define<typeof Parameters, Metadata, Messaging.Servic
               new Error(`s2s msg: target "${params.target}" is not in your s2s allow list (invite/accept first)`),
             )
 
-          // Same-process fast path: if the peer session is running in THIS
-          // process, enqueue straight into its in-process inbox tagged
-          // source="sibling-session" so the drain renders <external-context>.
-          // Bypasses the s2s_inbox table and the hourly outbound cap (both
-          // for cross-process only).
+          const presence = yield* store.peerCapability(targetID, Date.now())
+          if (presence.state === "incompatible")
+            return yield* Effect.fail(new Error(`Recipient is running an incompatible S2S build (capability ${presence.version}); upgrade it and retry.`))
           const inProcess = yield* isLocalForLatestUser(targetID, messaging, sessions)
-          if (inProcess) {
-            yield* messaging
-              .enqueue({
-                target: targetID,
-                from: ctx.sessionID,
-                fromSlug: me.slug,
-                fromName: me.title,
-                body: params.body,
-                source: "sibling-session",
-                sent: Date.now(),
-              })
-              .pipe(Effect.catchTag("Messaging.AbuseError", (e) => Effect.fail(new Error(e.detail))))
-            return {
-              title: `Sent to ${params.target}`,
-              metadata: { command: "msg", target: params.target, allowance: outboundAllowance(ctx.sessionID) },
-              output: `Queued in recipient's inbox (same process; does not count toward the cross-process allowance). ${allowanceText(ctx.sessionID)}`,
-            }
-          }
 
-          // Cross-process: persist to s2s_inbox; the recipient process's
-          // wake poller claims and delivers it.
-          const capsule: S2SCapsule = {
-            version: 1,
-            id: uuidv7(),
-            sender_slug: me.slug,
-            sender_name: me.title,
-            sender_session_id: String(ctx.sessionID),
-            timestamp: Date.now(),
-            body: params.body,
-          }
-          const outcome = yield* enqueueExternal({ store, target: targetID, fromSlug: me.slug, capsule }).pipe(
+          const capsule = capsuleFor(deliverAt)
+          const outcome = yield* enqueueExternal({ store, target: targetID, fromSlug: me.slug, capsule, expiresAt, deliverAt, supersedes: params.supersedes, scheduleKey: deliverAt === undefined ? undefined : `at:${deliverAt}` }).pipe(
             Effect.catchTag("Messaging.AbuseError", (e) => Effect.fail(new Error(e.detail))),
           )
           if (outcome._tag === "duplicate") {
             return {
               title: `Already sent to ${params.target}`,
-              metadata: { command: "msg", target: params.target, allowance: outboundAllowance(ctx.sessionID) },
+              metadata: { command: "msg", target: params.target, due_at: new Date(outcome.originalDueAt).toISOString(), allowance: outboundAllowance(ctx.sessionID) },
               output: `Already sent within the last ${DEDUPE_WINDOW_MS / 60_000} minutes (id=${outcome.originalInboxId}); not re-queued. ${allowanceText(ctx.sessionID)}`,
             }
           }
+          if (outcome._tag === "invalid_supersedes")
+            return yield* Effect.fail(new Error("s2s supersedes id must be a pending message from this sender to this recipient"))
           return {
             title: `Sent to ${params.target}`,
-            metadata: { command: "msg", target: params.target, allowance: outboundAllowance(ctx.sessionID) },
-            output: `Persisted to s2s_inbox (id=${capsule.id}); recipient process will poll and wake. ${allowanceText(ctx.sessionID)}`,
+            metadata: { command: "msg", target: params.target, due_at: new Date(deliverAt ?? outcome.sentAt).toISOString(), allowance: outboundAllowance(ctx.sessionID), supersession: outcome.supersession },
+              output: `Persisted to s2s_message (id=${capsule.id}); ${outcome.supersession === "superseded" ? `Retracted pending ${params.supersedes}. ` : outcome.supersession === "already_delivered" ? `Earlier ${params.supersedes} already delivered; not retracted. ` : outcome.supersession === "in_delivery" ? `Earlier ${params.supersedes} already in delivery; not retracted. ` : ""}${presence.state === "unknown" ? "No current presence record; stored pending and will deliver when the recipient runs a current build." : inProcess ? "Stored pending; local recipient will drain at the next safe turn." : "Stored pending; recipient process will poll and wake."} ${allowanceText(ctx.sessionID)}`,
+          }
+        }
+
+        case "sent": {
+          const rows = yield* store.sentHistory(ctx.sessionID, params.target ? SessionID.make(params.target) : undefined)
+          return {
+            title: "S2S sent history",
+            metadata: { command: "sent", target: params.target, history: rows },
+            output: rows.length === 0 ? "No sent s2s messages." : rows.map((row) =>
+              `${row.id} → ${row.target} · sent ${new Date(row.sentAt).toISOString()} · ${row.state}${row.deliveredAt !== null ? ` (${new Date(row.deliveredAt).toISOString()})` : ""}`,
+            ).join("\n"),
           }
         }
 
@@ -263,12 +300,13 @@ export const S2STool = Tool.define<typeof Parameters, Metadata, Messaging.Servic
               inbound,
             })
             return result
-          }, new Map<SessionID, Omit<Peer, "title">>())
+          }, new Map<SessionID, Omit<Peer, "title" | "activity">>())
+          const activity = yield* store.peerActivity([...peers.keys()], Date.now())
           const entries = yield* Effect.forEach(Array.from(peers.values()), (peer) =>
             sessions.get(peer.peer_id).pipe(
               Effect.map((session) => session.title || "(unknown)"),
               Effect.catchTag("NotFoundError", () => Effect.succeed("(unknown)")),
-              Effect.map((title) => ({ ...peer, title })),
+              Effect.map((title) => ({ ...peer, title, activity: activity.get(peer.peer_id) ?? "unknown" as const })),
             ),
           )
           const sorted = entries.toSorted((a, b) => b.established_at - a.established_at)
@@ -287,7 +325,7 @@ export const S2STool = Tool.define<typeof Parameters, Metadata, Messaging.Servic
                   peer.outbound === peer.inbound
                     ? "bidirectional"
                     : `ANOMALOUS one-way (${peer.outbound ? "outbound only" : "inbound only"})`
-                return `${peer.peer_id} · ${peer.title} · established ${new Date(peer.established_at).toISOString()} · consent: ${consent}`
+                return `${peer.peer_id} · ${peer.title} · established ${new Date(peer.established_at).toISOString()} · consent: ${consent} · ${peer.activity}`
               })
               .join("\n"),
           }
@@ -341,14 +379,8 @@ export const S2STool = Tool.define<typeof Parameters, Metadata, Messaging.Servic
   }),
 )
 
-// Module-local cross-process enqueue. See the file-level comment for
-// why this lives here instead of on Messaging.Interface. Contract:
-// SOFT per-process outbound throttle (over-cap → AbuseError) is
-// checked first, then durable dedup (s2s_sent table) + recipient
-// undelivered-row cap (INBOX_CAP → AbuseError "inbox full") in one
-// atomic write-lock-held transaction. The throttle counter is bumped
-// ONLY on a fresh insert — the duplicate / inbox-full paths do not
-// consume budget. Does NOT touch TREE_MESSAGE_CAP.
+// The soft per-process throttle cannot replace the transactionally enforced
+// recipient cap: other processes may write to the same database concurrently.
 const enqueueExternalBumpOutbound = new Map<SessionID, { hour: number; count: number }>()
 
 function outboundAllowance(sender: SessionID) {
@@ -365,7 +397,7 @@ function outboundAllowance(sender: SessionID) {
 
 function allowanceText(sender: SessionID) {
   const value = outboundAllowance(sender)
-  return `Cross-process sends this UTC clock hour: ${value.used}/${value.limit} used, ${value.remaining} remaining; resets at ${value.resets_at}.`
+  return `S2S sends this UTC clock hour: ${value.used}/${value.limit} used, ${value.remaining} remaining; resets at ${value.resets_at}.`
 }
 
 // Global cap on sender entries per Map to prevent unbounded growth
@@ -381,14 +413,13 @@ const evictIfNeeded = <V>(map: Map<SessionID, V>, max: number) => {
   }
 }
 
-// sha256(sender + NUL + recipient + NUL + body). The separator must
-// not appear in the session ids, so the boundaries between sender,
-// recipient, and body are unambiguous (NUL is the only byte that
-// cannot occur inside a `ses_` id). The key is content-addressed —
-// different bodies, different recipients, or a body sent after the
-// dedupe window all produce different keys and are sent normally.
-const dedupeKeyFor = async (sender: SessionID, recipient: SessionID, body: string): Promise<string> => {
-  const data = new TextEncoder().encode(`${sender}\u0000${recipient}\u0000${body}`)
+// Preserve old body-only keys across upgrades. Version the metadata form
+// before the recipient id so a body containing separators cannot mimic it.
+const dedupeKeyFor = async (sender: SessionID, recipient: SessionID, body: string, expiresAt?: number, supersedes?: string, scheduleKey?: string): Promise<string> => {
+  const material = expiresAt === undefined && supersedes === undefined && scheduleKey === undefined
+    ? `${sender}\u0000${recipient}\u0000${body}`
+    : `${sender}\u0000v2\u0000${recipient}\u0000${JSON.stringify({ body, expiresAt, supersedes, scheduleKey })}`
+  const data = new TextEncoder().encode(material)
   const digest = await crypto.subtle.digest("SHA-256", data)
   return Array.from(new Uint8Array(digest))
     .map((b) => b.toString(16).padStart(2, "0"))
@@ -400,6 +431,10 @@ const enqueueExternal = Effect.fn("S2STool.enqueueExternal")(function* (input: {
   target: SessionID
   fromSlug: string
   capsule: S2SCapsule
+  expiresAt?: number
+  deliverAt?: number
+  scheduleKey?: string
+  supersedes?: string
 }) {
   const sender = SessionID.make(input.capsule.sender_session_id)
   const store = input.store
@@ -420,11 +455,10 @@ const enqueueExternal = Effect.fn("S2STool.enqueueExternal")(function* (input: {
     return yield* new AbuseError({
       detail: `s2s outbound cap (${S2S_HOURLY_OUTBOUND_CAP}) reached for this session in the UTC clock hour; resets at ${outboundAllowance(sender).resets_at}`,
     })
-  // Durable insert-time dedupe: one transaction covers the dedup check,
-  // the inbox-cap check, the s2s_inbox insert, and the s2s_sent record.
+  // Durable insert-time dedupe covers the recipient cap and send record in one transaction.
   // A duplicate return takes the early-out path below and does NOT
   // consume the per-process outbound budget or the recipient's cap.
-  const dedupeKey = yield* Effect.promise(() => dedupeKeyFor(sender, input.target, input.capsule.body))
+  const dedupeKey = yield* Effect.promise(() => dedupeKeyFor(sender, input.target, input.capsule.body, input.expiresAt, input.supersedes, input.scheduleKey))
   const result = yield* store.tryEnqueueWithDedup({
     dedupeKey,
     sender,
@@ -433,18 +467,22 @@ const enqueueExternal = Effect.fn("S2STool.enqueueExternal")(function* (input: {
     capsule: encodeCapsule(input.capsule),
     capsuleId: input.capsule.id,
     timeCreated: now,
+    expiresAt: input.expiresAt,
+    deliverAt: input.deliverAt,
+    supersedes: input.supersedes,
     windowMs: DEDUPE_WINDOW_MS,
     inboxCap: INBOX_CAP,
   })
   if (result._tag === "duplicate") {
-    return { _tag: "duplicate" as const, originalInboxId: result.originalInboxId }
+    return { _tag: "duplicate" as const, originalInboxId: result.originalInboxId, originalDueAt: result.originalDueAt }
   }
   if (result._tag === "inbox_full") {
     return yield* new AbuseError({
       detail: `recipient s2s inbox cap (${INBOX_CAP}) reached`,
     })
   }
+  if (result._tag === "invalid_supersedes") return result
   enqueueExternalBumpOutbound.set(sender, { hour: current.hour, count: current.count + 1 })
   evictIfNeeded(enqueueExternalBumpOutbound, MAX_SENDER_ENTRIES)
-  return { _tag: "inserted" as const, inboxId: result.inboxId }
+  return { _tag: "inserted" as const, inboxId: result.inboxId, sentAt: result.sentAt, supersession: result.supersession }
 })
