@@ -98,4 +98,11 @@ describe("plugin.config-hook-error-isolation", () => {
       /for\s*\(const hook of hooks\)\s*\{[\s\S]*?Effect\.tryPromise[\s\S]*?\.config\?\.\([\s\S]*?plugin config hook failed[\s\S]*?Effect\.ignore/
     expect(pattern.test(src)).toBe(true)
   })
+
+  test("plugin initialization failures publish a session error notice", async () => {
+    const src = await Bun.file(file).text()
+    expect(src).toMatch(
+      /Effect\.tapError\(\(error\) => Effect\.logError\("failed to load plugin", \{ path: load\.spec, error \}\)\)[\s\S]*?Effect\.catch\(\(error\) => \{[\s\S]*?publishPluginError\(`Failed to load plugin \$\{load\.spec\}: \$\{error\}`\)/,
+    )
+  })
 })
