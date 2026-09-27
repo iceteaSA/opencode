@@ -271,8 +271,9 @@ s2sIt.instance("run-loop receipt persists canonical mail before the next provide
     yield* prompt.loop({ sessionID: chat.id })
     const receipts = (yield* sessions.messages({ sessionID: chat.id })).filter((message) => message.info.role === "user" && message.info.origin === "s2s")
     expect(receipts).toHaveLength(1)
-    expect(receipts[0]?.parts).toHaveLength(2)
-    expect(receipts[0]?.parts.some((part) => part.type === "text" && part.synthetic && part.text.includes("canonical body"))).toBe(true)
+    const frameParts = receipts[0]!.parts.filter((part) => part.id === `prt_${id}_frame` || part.id === `prt_${id}_marker`)
+    expect(frameParts).toHaveLength(2)
+    expect(frameParts.some((part) => part.type === "text" && part.synthetic && part.text.includes("canonical body"))).toBe(true)
     expect(yield* db.get(sql`SELECT transcript_message_id FROM s2s_message WHERE id = ${id} AND delivered_at IS NOT NULL`)).toEqual({ transcript_message_id: receipts[0]?.info.id })
     yield* llm.reset
   }),
@@ -294,8 +295,9 @@ s2sIt.instance("run-loop emits one expiration notice and never admits the expire
     yield* prompt.loop({ sessionID: chat.id })
     const notices = (yield* sessions.messages({ sessionID: chat.id })).filter((message) => message.info.role === "user" && message.info.origin === "s2s")
     expect(notices).toHaveLength(1)
-    expect(notices[0]?.parts).toHaveLength(1)
-    expect(JSON.stringify(notices)).toContain("2 expired")
+    const noticeParts = notices[0]!.parts.filter((part) => !(part.type === "text" && part.text.startsWith("<system-reminder>Today's date is ")))
+    expect(noticeParts).toHaveLength(1)
+    expect(JSON.stringify(noticeParts)).toContain("2 expired")
     expect(JSON.stringify(notices)).not.toContain("EXPIRED-ORIGINAL")
     expect(yield* db.get(sql`SELECT count(*) AS count FROM s2s_message WHERE target_session_id = ${chat.id} AND expired_at IS NOT NULL AND delivered_at IS NULL`)).toEqual({ count: 2 })
     yield* llm.reset
