@@ -802,7 +802,8 @@ describe("task outcomes: real SessionPrompt and task dispatch", () => {
             Effect.gen(function* () {
               const count = (yield* notices()).length
               const parentStatus = yield* status.get(parent.id)
-              return count === 2 && parentStatus.type === "idle" ? count : undefined
+              const childStatus = yield* status.get(child.id)
+              return count === 2 && parentStatus.type === "idle" && childStatus.type === "idle" ? count : undefined
             }),
             "first idle wake did not finish",
             "5 seconds",
@@ -816,7 +817,11 @@ describe("task outcomes: real SessionPrompt and task dispatch", () => {
           yield* llm.textMatch(matchesUser("adjust focus"), "final answer")
           yield* llm.textMatch(matchesUser("run #3"), "third notice handled")
           yield* messaging.enqueue({ target: child.id, from: sibling.id, fromSlug: "sibling", body: "second ping" })
-          yield* llm.wait(before + 1)
+          yield* pollWithTimeout(
+            Effect.map(llm.inputs, (inputs) => inputs.slice(before).some((body) => matchesUser("second ping")({ body })) || undefined),
+            "held second ping did not reach the provider",
+            "15 seconds",
+          )
           expect((yield* status.get(child.id)).type).toBe("busy")
           yield* interrupt.request({ sessionID: child.id, intent: "steer", reason: "adjust focus", origin: "parent" })
           gate.resolve()
