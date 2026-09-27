@@ -11,7 +11,7 @@ import { Config } from "@/config/config"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Session } from "@/session/session"
-import type { SessionPrompt } from "../../src/session/prompt"
+import { SessionPrompt } from "../../src/session/prompt"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
@@ -28,6 +28,7 @@ import { pollWithTimeout, testEffect } from "../lib/effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { Messaging } from "../../src/messaging"
+import { caseFor, providerCfgFor, useServerConfig } from "../messaging/task-outcomes-fixture"
 
 afterEach(async () => {
   await disposeAllInstances()
@@ -349,6 +350,160 @@ describe("tool.task", () => {
       expect(yield* messaging.getAllow(child.id)).toEqual([])
       expect((yield* sessions.get(child.id)).metadata?.message_allow).toEqual([])
     }),
+  )
+
+  for (const scenario of [
+    { name: "resume widens permission when the parent removes a deny", initiallyDenied: true, restricted: false },
+    { name: "resume narrows permission when the parent adds a deny", initiallyDenied: false, restricted: false },
+    {
+      name: "resume keeps dispatch-only primary tool restrictions",
+      initiallyDenied: true,
+      restricted: true,
+    },
+  ])
+    caseFor().instance(scenario.name, () =>
+      Effect.gen(function* () {
+        const { llm } = yield* useServerConfig((url) => ({
+          ...providerCfgFor(url),
+          ...(scenario.restricted ? { experimental: { primary_tools: ["glob"] } } : {}),
+        }))
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const { chat, assistant } = yield* seed()
+        const def = (yield* (yield* ToolRegistry.Service).named()).task
+        const promptOps: TaskPromptOps = {
+          cancel: prompt.cancel,
+          cancelRun: () => Effect.void,
+          resolvePromptParts: prompt.resolvePromptParts,
+          prompt: (input) => prompt.prompt(input).pipe(Effect.orDie),
+          loop: (sessionID) => prompt.loop({ sessionID }),
+        }
+        const ctx = {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        }
+        const dispatch = (taskID: string, resume?: boolean) =>
+          def.execute(
+            {
+              description: "check current permissions",
+              prompt: `permission check ${taskID}`,
+              subagent_type: "general",
+              model: "test/test-model",
+              task_id: taskID,
+              resume,
+            },
+            ctx,
+          )
+        const parentRules = [{ permission: "*", pattern: "*", action: "allow" as const }]
+        const readDeny = { permission: "read", pattern: "*", action: "deny" as const }
+        yield* sessions.setPermission({
+          sessionID: chat.id,
+          permission: scenario.initiallyDenied ? [...parentRules, readDeny] : parentRules,
+        })
+        yield* llm.text("first denied turn")
+        const first = yield* dispatch("permission-change")
+        const child = yield* sessions.get(first.metadata.sessionId as SessionID)
+        if (scenario.restricted)
+          expect(child.permission).toContainEqual({ permission: "glob", pattern: "*", action: "deny" })
+
+        yield* sessions.setPermission({
+          sessionID: chat.id,
+          permission: scenario.initiallyDenied ? parentRules : [...parentRules, readDeny],
+        })
+        yield* llm.text("resumed allowed turn")
+        yield* dispatch("permission-change", true)
+
+        const requests = yield* llm.inputs
+        const offered = (request: Record<string, unknown>, name: string) =>
+          Array.isArray(request.tools) && request.tools.some((item) => item.function?.name === name)
+        expect(requests).toHaveLength(2)
+        expect(offered(requests[0]!, "read")).toBe(!scenario.initiallyDenied)
+        expect(offered(requests[1]!, "read")).toBe(scenario.initiallyDenied)
+        expect(offered(requests[1]!, "glob")).toBe(!scenario.restricted)
+        expect(offered(requests[1]!, "task")).toBe(false)
+        expect(offered(requests[1]!, "todowrite")).toBe(false)
+      }),
+    )
+
+  caseFor().instance(
+    "resume preserves wake_on_message and wakes for a queued message",
+    () =>
+      Effect.gen(function* () {
+        const { llm } = yield* useServerConfig(providerCfgFor)
+        const sessions = yield* Session.Service
+        const prompt = yield* SessionPrompt.Service
+        const messaging = yield* Messaging.Service
+        const { chat, assistant } = yield* seed()
+        const def = (yield* (yield* ToolRegistry.Service).named()).task
+        const ctx = {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: {
+            promptOps: {
+              cancel: prompt.cancel,
+              cancelRun: () => Effect.void,
+              resolvePromptParts: prompt.resolvePromptParts,
+              prompt: (input) => prompt.prompt(input).pipe(Effect.orDie),
+              loop: (sessionID: SessionID) => prompt.loop({ sessionID }),
+            } satisfies TaskPromptOps,
+          },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        }
+        const dispatch = (options: { resume?: boolean; wake_on_message?: boolean }) =>
+          def.execute(
+            {
+              description: "wake child",
+              prompt: "read queued messages",
+              subagent_type: "general",
+              model: "test/test-model",
+              task_id: "wake-child",
+              ...options,
+            },
+            ctx,
+          )
+        yield* llm.text("initial answer")
+        const first = yield* dispatch({ wake_on_message: true })
+        const childID = first.metadata.sessionId as SessionID
+        yield* messaging.setWakePolicy({ sessionID: childID, budget: 0 })
+        yield* llm.text("resumed answer")
+        yield* dispatch({ resume: true })
+        yield* llm.text("woke and answered")
+        yield* messaging.enqueue({ target: childID, from: chat.id, fromSlug: "coordinator", body: "wake check" })
+        const marker = yield* pollWithTimeout(
+          Effect.map(
+            sessions.messages({ sessionID: childID }),
+            (messages) =>
+              messages
+                .flatMap((message) => message.parts)
+                .filter((part): part is SessionV1.TextPart => part.type === "text")
+                .find((part) => part.text.includes("wake check"))?.text,
+          ),
+          "resumed child did not wake for queued message",
+          "2 seconds",
+        )
+        expect(marker).toContain("wake check")
+        expect((yield* sessions.get(childID)).metadata?.wake_on_message).toBe(true)
+        const status = yield* SessionStatus.Service
+        yield* pollWithTimeout(
+          Effect.map(status.get(childID), (state) => (state.type === "idle" ? true : undefined)),
+          "woken child did not become idle",
+          "2 seconds",
+        )
+        yield* llm.text("explicit wake disabled")
+        yield* dispatch({ resume: true, wake_on_message: false })
+        expect((yield* sessions.get(childID)).metadata?.wake_on_message).toBe(false)
+      }),
+    10000,
   )
 
   it.instance("execute surfaces child errors with a resumable task_id", () =>

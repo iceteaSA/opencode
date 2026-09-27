@@ -466,6 +466,16 @@ export const TaskTool = Tool.define(
           action: "deny" as const,
         })) ?? []),
       ]
+      const resolvedPermission = [
+        ...childPermission,
+        ...childToolDenies.filter(
+          (deny) =>
+            !childPermission.some(
+              (rule) =>
+                rule.permission === deny.permission && rule.pattern === deny.pattern && rule.action === deny.action,
+            ),
+        ),
+      ]
       const nextSession =
         session ??
         (yield* childLocks.withLock(ctx.sessionID)(
@@ -490,24 +500,19 @@ export const TaskTool = Tool.define(
               model: overrideModel
                 ? { id: overrideModel.modelID, providerID: overrideModel.providerID }
                 : undefined,
-              permission: [
-                ...childPermission,
-                ...childToolDenies.filter(
-                  (deny) =>
-                    !childPermission.some(
-                      (rule) =>
-                        rule.permission === deny.permission && rule.pattern === deny.pattern && rule.action === deny.action,
-                    ),
-                ),
-              ],
+              permission: resolvedPermission,
               metadata: {
                 ...params.metadata,
                 ...(params.message_allow === undefined ? {} : { message_allow: [...params.message_allow] }),
+                ...(params.wake_on_message === undefined ? {} : { wake_on_message: params.wake_on_message }),
               },
               ...(contextMode === "sparse" ? { contextMode } : {}),
             })
           }),
         ))
+
+      // Later child-specific session rules are replaced: resume resolves the same rules as a fresh dispatch.
+      if (session) yield* sessions.setPermission({ sessionID: session.id, permission: resolvedPermission })
 
       if (params.task_id) yield* messaging.registerSlug(params.task_id, nextSession.id)
       if (!session || params.message_allow !== undefined || Array.isArray(session.metadata?.message_allow))
@@ -515,16 +520,20 @@ export const TaskTool = Tool.define(
           ...(params.message_allow ??
             (Array.isArray(session?.metadata?.message_allow) ? session.metadata.message_allow : [])),
         ])
-      if (params.wake_on_message === true)
-        yield* messaging.setWakePolicy({ sessionID: nextSession.id, budget: WAKE_BUDGET_DEFAULT })
+      if (params.wake_on_message !== undefined || session?.metadata?.wake_on_message === true)
+        yield* messaging.setWakePolicy({
+          sessionID: nextSession.id,
+          budget: (params.wake_on_message ?? session?.metadata?.wake_on_message) === true ? WAKE_BUDGET_DEFAULT : 0,
+        })
 
-      if (session && (params.metadata || params.message_allow !== undefined)) {
+      if (session) {
         yield* sessions.setMetadata({
           sessionID: session.id,
           metadata: {
             ...session.metadata,
             ...params.metadata,
             ...(params.message_allow === undefined ? {} : { message_allow: [...params.message_allow] }),
+            ...(params.wake_on_message === undefined ? {} : { wake_on_message: params.wake_on_message }),
           },
         })
       }
