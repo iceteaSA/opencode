@@ -22,7 +22,7 @@
 // Dropping either fix reproduces the RED failure below (see the fix's
 // commit message / return summary for the before/after run transcripts).
 
-import { EffectFlock } from '@opencode-ai/core/util/effect-flock';
+import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { afterEach, describe, expect } from "bun:test"
 import { Effect, Layer } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -72,7 +72,7 @@ import { ToolRegistry } from "@/tool/registry"
 import { Truncate } from "@/tool/truncate"
 import { SessionID } from "../../src/session/schema"
 import { TestInstance, disposeAllInstances } from "../fixture/fixture"
-import { pollWithTimeout, testEffectShared } from "../lib/effect"
+import { pollWithTimeout, testEffectIsolatedShared } from "../lib/effect"
 import { TestLLMServer } from "../lib/llm-server"
 import { WAKE_BUDGET_DEFAULT } from "../../src/tool/task"
 
@@ -134,8 +134,16 @@ const lspStub = Layer.succeed(
   }),
 )
 
-const statusNode = LayerNode.make({ service: SessionStatus.Service, layer: SessionStatus.layer, deps: [EventV2Bridge.node] })
-const runStateNode = LayerNode.make({ service: SessionRunState.Service, layer: SessionRunState.layer, deps: [BackgroundJob.node, statusNode, EffectFlock.node] })
+const statusNode = LayerNode.make({
+  service: SessionStatus.Service,
+  layer: SessionStatus.layer,
+  deps: [EventV2Bridge.node],
+})
+const runStateNode = LayerNode.make({
+  service: SessionRunState.Service,
+  layer: SessionRunState.layer,
+  deps: [BackgroundJob.node, statusNode, EffectFlock.node],
+})
 
 // experimentalS2S stays OFF here — wake-on-message (task.ts's wake_on_message
 // param → Messaging.setWakePolicy) is independent of the s2s cross-process
@@ -225,7 +233,7 @@ function makeRunLoopLayer() {
 }
 
 const wakeLayer = Layer.mergeAll(TestLLMServer.layer, makeRunLoopLayer())
-const it = testEffectShared(wakeLayer as unknown as Layer.Layer<any, any, never>)
+const it = testEffectIsolatedShared(wakeLayer as unknown as Layer.Layer<any, any, never>)
 
 const writeConfig = Effect.fn("WakeRealPath.writeConfig")(function* (dir: string, config: Partial<ConfigV1.Info>) {
   const fs = yield* FSUtil.Service
@@ -325,7 +333,11 @@ describe("wake-on-message: real path (SessionPrompt.layer + real Messaging.enque
             )
         })
 
-        const marker = yield* pollWithTimeout(findMarker, "wake-on-message real path: inbox marker never appeared", "5 seconds")
+        const marker = yield* pollWithTimeout(
+          findMarker,
+          "wake-on-message real path: inbox marker never appeared",
+          "5 seconds",
+        )
 
         if (marker.type !== "text") throw new Error("unreachable: type narrowed above")
         expect(marker.text).toContain("sibling-x")
