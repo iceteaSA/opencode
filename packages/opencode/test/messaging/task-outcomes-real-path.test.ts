@@ -146,7 +146,13 @@ const emptyCompletion = Effect.fn("TaskOutcomesTest.emptyCompletion")(function* 
       messages
         .filter((message) => message.info.role === "user")
         .flatMap((message) => message.parts)
-        .filter((part) => part.type === "text" && part.text !== "start"),
+        .filter(
+          (part) =>
+            part.type === "text" &&
+            part.synthetic &&
+            (part.text.includes(`<task id="${child.id}"`) ||
+              part.text.includes(`full result: task session ${child.id}`)),
+        ),
     )
   const first = yield* pollWithTimeout(
     Effect.gen(function* () {
