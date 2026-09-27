@@ -28,6 +28,36 @@ export const S2SInboxTable = sqliteTable(
   (table) => [index("s2s_inbox_target").on(table.target_session_id, table.drained_at)],
 )
 
+export const S2SMessageTable = sqliteTable(
+  "s2s_message",
+  {
+    id: text().primaryKey(),
+    target_session_id: text().notNull(),
+    from_session_id: text().notNull(),
+    from_slug: text().notNull(),
+    capsule: text().notNull(),
+    sent_at: integer().notNull(),
+    delivered_at: integer(),
+    expired_at: integer(),
+    superseded_at: integer(),
+    supersedes: text(),
+    expires_at: integer(),
+    deliver_at: integer(),
+    transcript_message_id: text(),
+  },
+  (table) => [
+    index("s2s_message_pending").on(table.target_session_id, table.deliver_at, table.delivered_at),
+    index("s2s_message_sender_sent").on(table.from_session_id, table.sent_at),
+  ],
+)
+
+export const S2SPresenceTable = sqliteTable("s2s_presence", {
+  session_id: text().primaryKey(),
+  owner_id: text().notNull(),
+  capability_version: integer().notNull(),
+  heartbeat_at: integer().notNull(),
+})
+
 export const S2STokenTable = sqliteTable("s2s_token", {
   token: text().primaryKey(),
   inviter_session_id: text().notNull(),

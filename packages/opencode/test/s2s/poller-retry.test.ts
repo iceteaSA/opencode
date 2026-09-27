@@ -1,6 +1,8 @@
 import { expect } from "bun:test"
 import { Effect, Layer, Option } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
+import { EventV2 } from "@opencode-ai/core/event"
+import { EventV2Bridge } from "../../src/event-v2-bridge"
 import { Messaging } from "../../src/messaging"
 import { pollOnceImpl } from "../../src/s2s/poller"
 import { S2SStore } from "../../src/s2s/store"
@@ -24,19 +26,35 @@ const capsule = encodeCapsule({
   body: "BOUNDED-RETRY-PAYLOAD",
 })
 
+const interceptedStore = Layer.effect(S2SStore.Service, Effect.gen(function* () {
+  const store = yield* S2SStore.Service
+  return S2SStore.Service.of({
+    ...store,
+    receipt: () => {
+      attempts++
+      if (enqueueResults.shift() === true) return Effect.succeed(true)
+      return Effect.fail(new S2SStore.S2SStoreError({ message: "deterministic test failure", cause: null }))
+    },
+  })
+})).pipe(Layer.provide(S2SStore.layer))
+
 const it = testEffectIsolatedShared(
   Layer.mergeAll(
-    S2SStore.defaultLayer,
+    interceptedStore,
+    Layer.succeed(EventV2Bridge.Service, { publish: () => Effect.void } as unknown as EventV2.Interface),
     Layer.succeed(SessionStatus.Service, {
-      get: () => Effect.succeed({ type: "busy" as const }),
+      get: () => Effect.succeed({ type: "idle" as const }),
       list: () => Effect.succeed(new Map()),
       set: () => Effect.succeed(undefined),
     }),
     Layer.succeed(Session.Service, {
-      findMessage: () => Effect.succeed(Option.none()),
+      findMessage: () => Effect.succeed(Option.some({ info: {
+        id: "msg_retry_user", sessionID: target, role: "user", agent: "build",
+        model: { providerID: "test", modelID: "test" }, time: { created: 1 },
+      }, parts: [] })),
     } as unknown as Session.Interface),
     Layer.succeed(SessionPrompt.Service, {
-      loop: () => Effect.die("unexpected SessionPrompt.loop"),
+      loop: () => Effect.succeed(undefined),
     } as unknown as SessionPrompt.Interface),
     Layer.succeed(Messaging.Service, {
       send: () => Effect.die("unexpected Messaging.send"),
@@ -48,11 +66,7 @@ const it = testEffectIsolatedShared(
       setAllow: () => Effect.die("unexpected Messaging.setAllow"),
       getAllow: () => Effect.die("unexpected Messaging.getAllow"),
       slugFor: () => Effect.die("unexpected Messaging.slugFor"),
-      enqueue: () => {
-        attempts++
-        if (enqueueResults.shift() === true) return Effect.succeed(undefined)
-        return Effect.fail(new Messaging.AbuseError({ detail: "deterministic test failure" }))
-      },
+      enqueue: () => Effect.die("unexpected Messaging.enqueue"),
       drain: () => Effect.die("unexpected Messaging.drain"),
       awaitInbox: () => Effect.die("unexpected Messaging.awaitInbox"),
       registerLocal: () => Effect.die("unexpected Messaging.registerLocal"),

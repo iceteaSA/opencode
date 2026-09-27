@@ -16,7 +16,7 @@ import { expect } from "bun:test"
 import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Logger, Option, Scope } from "effect"
 import path from "path"
 import { rm } from "node:fs/promises"
-import { fileURLToPath } from "url"
+import { fileURLToPath, pathToFileURL } from "url"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Agent as AgentSvc } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
@@ -64,7 +64,7 @@ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
 import { TestInstance, withTmpdirInstance } from "../fixture/fixture"
-import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
+import { awaitWithTimeout, pollWithTimeout, testEffect, testEffectIsolatedShared } from "../lib/effect"
 import { reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -273,6 +273,7 @@ function makeHttpNoLLMServer(input?: {
 }
 
 const it = testEffect(makeHttp() as unknown as Layer.Layer<any, any, never>)
+const originPlugin = testEffectIsolatedShared(makeHttp() as unknown as Layer.Layer<any, any, never>)
 const noLLMServer = testEffect(makeHttpNoLLMServer() as unknown as Layer.Layer<any, any, never>)
 const backgroundNoLLMServer = testEffect(
   makePrompt({ runtimeFlags: backgroundRuntimeFlags }) as unknown as Layer.Layer<any, any, never>,
@@ -479,6 +480,44 @@ const boot = Effect.fn("test.boot")(function* (input?: { title?: string }) {
   const chat = yield* sessions.create(input ?? { title: "Pinned" })
   return { prompt, run, sessions, chat }
 })
+
+originPlugin.instance("chat.message receives the operator origin persisted on the user row", () =>
+  Effect.gen(function* () {
+    const { directory } = yield* TestInstance
+    const pluginFile = path.join(directory, "origin-plugin.ts")
+    const capture = path.join(directory, "origin-seen.txt")
+    yield* Effect.promise(() => Bun.write(pluginFile, `export default async () => ({ "chat.message": async (_input, output) => { await Bun.write(${JSON.stringify(capture)}, output.message.origin ?? "missing") } })`))
+    yield* writeConfig(directory, { ...cfg, plugin: [pathToFileURL(pluginFile).href] })
+    const { chat, prompt, sessions } = yield* boot()
+    const message = yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      noReply: true,
+      parts: [{ type: "text", text: "plugin origin" }],
+    })
+    expect(yield* Effect.promise(() => Bun.file(capture).text())).toBe("operator")
+    expect(message.info.role === "user" && message.info.origin).toBe("operator")
+    const projected = (yield* sessions.messages({ sessionID: chat.id })).findLast((item) => item.info.role === "user")
+    expect(projected?.info.role === "user" && projected.info.origin).toBe("operator")
+  }),
+)
+
+originPlugin.instance("no-origin prompts infer machine-only vs human input and preserve explicit origin", () =>
+  Effect.gen(function* () {
+    const { prompt, chat, sessions } = yield* boot()
+    const machine = yield* prompt.prompt({ sessionID: chat.id, agent: "build", model: ref, noReply: true, parts: [{ type: "text", text: "machine", synthetic: true }] })
+    expect(machine.info.role === "user" && machine.info.origin).toBe("system")
+    const human = yield* prompt.prompt({ sessionID: chat.id, agent: "build", model: ref, noReply: true, parts: [{ type: "text", text: "human" }] })
+    expect(human.info.role === "user" && human.info.origin).toBe("operator")
+    const mention = yield* prompt.prompt({ sessionID: chat.id, agent: "build", model: ref, noReply: true, parts: [{ type: "text", text: "human @build" }, { type: "agent", name: "build" }] })
+    expect(mention.info.role === "user" && mention.info.origin).toBe("operator")
+    const explicit = yield* prompt.prompt({ sessionID: chat.id, agent: "build", model: ref, noReply: true, origin: "peer", parts: [{ type: "text", text: "synthetic", synthetic: true }] })
+    expect(explicit.info.role === "user" && explicit.info.origin).toBe("peer")
+    const stored = yield* sessions.messages({ sessionID: chat.id })
+    expect(stored.filter((row) => row.info.role === "user").map((row) => row.info.role === "user" && row.info.origin)).toEqual(["system", "operator", "operator", "peer"])
+  }),
+)
 
 it.instance("prompt persists the timestamp embedded in its freshly minted message ID", () =>
   Effect.acquireUseRelease(

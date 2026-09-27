@@ -77,6 +77,7 @@ import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { TestInstance, disposeAllInstances } from "../fixture/fixture"
 import { testEffectIsolatedShared } from "../lib/effect"
 import { TestLLMServer } from "../lib/llm-server"
+import { countUndelivered } from './fixtures/undelivered-count';
 
 afterEach(async () => {
   await disposeAllInstances()
@@ -299,22 +300,22 @@ describe("s2s C′ wake-poller: forked-from-loop claims a DB row on an idle sess
           fromSessionID: SessionID.make("ses_cprime_sender_sessionx"),
           fromSlug: "sender-x",
           capsule: JSON.stringify({
-            v: 1,
+            version: 1,
             id: "01999999-aaaa-7000-8000-000000000001",
             sender_session_id: "ses_cprime_sender_sessionx",
             sender_slug: "sender-x",
             body: "cprime-payload",
-            created_at: Date.now(),
+            timestamp: Date.now(),
           }),
           timeCreated: Date.now(),
         })
 
         // The C′ poller (forked above) must claim this WITHOUT another loop.
         // Poll-wait up to ~5s (OPENCODE_S2S_POLL_MS should be small).
-        let undelivered = yield* store.countUndelivered(chat.id)
+        let undelivered = yield* countUndelivered(chat.id)
         for (let i = 0; i < 25 && undelivered > 0; i++) {
           yield* Effect.sleep("200 millis")
-          undelivered = yield* store.countUndelivered(chat.id)
+          undelivered = yield* countUndelivered(chat.id)
         }
 
         // THE assertion: the row is claimed by the C′ poller.
@@ -363,7 +364,7 @@ describe("s2s C′ wake-poller: forked-from-loop claims a DB row on an idle sess
 
         // Wait well past several poll intervals. With no poller, nothing claims.
         yield* Effect.sleep("2 seconds")
-        const undelivered = yield* store.countUndelivered(chat.id)
+        const undelivered = yield* countUndelivered(chat.id)
 
         // Hypothesis: stays unclaimed because no poller was ever forked.
         expect(undelivered).toBe(1)

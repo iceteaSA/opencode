@@ -360,6 +360,10 @@ exports[`tool parameters JSON Schema (wire shape) task 1`] = `
       "description": "Explicit consent to resume an existing idle task session named by task_id. Required when task_id refers to a session with no currently-running background job. A live background task still accepts task_id updates without this flag.",
       "type": "boolean",
     },
+    "start_at": {
+      "description": "Admit this task durably for a timezone-qualified ISO-8601 instant; future starts require background: true and are not executed until due",
+      "type": "string",
+    },
     "subagent_type": {
       "description": "The type of specialized agent to use for this task",
       "type": "string",

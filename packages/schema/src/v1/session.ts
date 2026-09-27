@@ -332,6 +332,7 @@ const messageBase = {
 export const User = Schema.Struct({
   ...messageBase,
   role: Schema.Literal("user"),
+  origin: Schema.optional(Schema.Literals(["operator", "subagent", "plugin", "peer", "s2s", "mixed", "wake", "compaction", "system"])),
   time: Schema.Struct({
     created: Timestamp,
   }),

@@ -18,6 +18,7 @@ Model selection:
 Reliability:
 - `timeout` (ms) bounds a single subagent attempt; on expiry the attempt is interrupted.
 - `fallback_model` (provider/model) retries the task once on the fallback when the primary attempt times out or fails. Requires the model_override permission. Parent-initiated aborts never trigger the fallback.
+- `start_at` (timezone-qualified ISO-8601) with `background: true` admits a future task durably. It does not start the child or reserve a background job at admission. The task starts when its parent next owns a run after the due time; there is no timer that starts it while the parent is idle. A late start notifies the parent. The child's permissions are recomputed from the parent's current rules at start, not replayed from the admission record. If the process crashes before launch, a claim may be retried after 30 seconds. If it loses the owner after launch, the task is reported as ambiguous and never replayed automatically; inspect the child session before retrying. A past `start_at` follows the normal immediate dispatch path.
 
 Usage notes:
 1. Launch multiple agents concurrently whenever possible, to maximize performance; to do that, use a single message with multiple tool uses

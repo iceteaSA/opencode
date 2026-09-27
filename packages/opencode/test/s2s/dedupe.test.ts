@@ -141,8 +141,8 @@ describe("S2S cross-process insert-time dedupe", () => {
       const def = yield* tool.init()
 
       const first = yield* def.execute({ command: "msg", target: target.id, body: "same-body" }, ctxFor(sender.id))
-      expect(first.output).toContain("Persisted to s2s_inbox")
-      const firstClaimed = yield* store.claimForSessions([target.id])
+      expect(first.output).toContain("Persisted to s2s_message")
+      const firstClaimed = yield* store.pendingForSession(target.id, Date.now())
       const firstInboxId = firstClaimed[0]!.id
 
       const second = yield* def.execute({ command: "msg", target: target.id, body: "same-body" }, ctxFor(sender.id))
@@ -155,7 +155,7 @@ describe("S2S cross-process insert-time dedupe", () => {
       // accidentally re-claim and lose the visibility).
       const { db } = yield* Database.Service
       const inboxCount = yield* db.all<{ n: number }>(sql`
-        SELECT COUNT(*) AS n FROM s2s_inbox WHERE target_session_id = ${target.id}
+        SELECT COUNT(*) AS n FROM s2s_message WHERE target_session_id = ${target.id}
       `)
       expect(inboxCount[0]?.n).toBe(1)
       // And the dedupe ledger has exactly one row for this key.
@@ -184,12 +184,13 @@ describe("S2S cross-process insert-time dedupe", () => {
       // Simulate the recipient process draining + hard-deleting the row
       // (the poller's success path). One claim, one delete, then the
       // inbox is empty again.
-      const claimed = yield* store.claimForSessions([target.id])
+      const claimed = yield* store.pendingForSession(target.id, Date.now())
       expect(claimed).toHaveLength(1)
       const originalId = claimed[0]!.id
       expect(first.output).toContain(originalId)
-      yield* store.deleteInbox(originalId)
-      expect(yield* store.claimForSessions([target.id])).toEqual([])
+      const { db } = yield* Database.Service
+      yield* db.run(sql`UPDATE s2s_message SET delivered_at = ${Date.now()} WHERE id = ${originalId}`)
+      expect(yield* store.pendingForSession(target.id, Date.now())).toEqual([])
 
       // The retry still resolves as a duplicate because the s2s_sent
       // row outlives the s2s_inbox row.
@@ -199,7 +200,7 @@ describe("S2S cross-process insert-time dedupe", () => {
       )
       expect(retry.output).toContain("Already sent within the last 10 minutes")
       expect(retry.output).toContain(originalId)
-      expect(yield* store.claimForSessions([target.id])).toEqual([])
+      expect(yield* store.pendingForSession(target.id, Date.now())).toEqual([])
     }),
   )
 
@@ -239,7 +240,7 @@ describe("S2S cross-process insert-time dedupe", () => {
       expect(second._tag).toBe("inserted")
 
       // Two inbox rows total.
-      const rows = yield* store.claimForSessions([target.id])
+      const rows = yield* store.pendingForSession(target.id, t2)
       expect(rows.map((r) => r.id).sort()).toEqual(["caps_first_window", "caps_second_window"])
     }),
   )
@@ -255,8 +256,8 @@ describe("S2S cross-process insert-time dedupe", () => {
 
       yield* def.execute({ command: "msg", target: target.id, body: "body-a" }, ctxFor(sender.id))
       const second = yield* def.execute({ command: "msg", target: target.id, body: "body-b" }, ctxFor(sender.id))
-      expect(second.output).toContain("Persisted to s2s_inbox")
-      const rows = yield* store.claimForSessions([target.id])
+      expect(second.output).toContain("Persisted to s2s_message")
+      const rows = yield* store.pendingForSession(target.id, Date.now())
       expect(rows).toHaveLength(2)
     }),
   )
@@ -274,9 +275,9 @@ describe("S2S cross-process insert-time dedupe", () => {
 
       yield* def.execute({ command: "msg", target: target1.id, body: "shared" }, ctxFor(sender.id))
       const second = yield* def.execute({ command: "msg", target: target2.id, body: "shared" }, ctxFor(sender.id))
-      expect(second.output).toContain("Persisted to s2s_inbox")
-      expect(yield* store.claimForSessions([target1.id])).toHaveLength(1)
-      expect(yield* store.claimForSessions([target2.id])).toHaveLength(1)
+      expect(second.output).toContain("Persisted to s2s_message")
+      expect(yield* store.pendingForSession(target1.id, Date.now())).toHaveLength(1)
+      expect(yield* store.pendingForSession(target2.id, Date.now())).toHaveLength(1)
     }),
   )
 
@@ -339,7 +340,7 @@ describe("S2S cross-process insert-time dedupe", () => {
       const [a, b] = yield* Effect.all([Fiber.join(fiberA), Fiber.join(fiberB)])
       const tags = [a._tag, b._tag].sort()
       expect(tags).toEqual(["duplicate", "inserted"])
-      const inboxRows = yield* store.claimForSessions([target.id])
+      const inboxRows = yield* store.pendingForSession(target.id, Date.now())
       expect(inboxRows).toHaveLength(1)
     }),
   )
@@ -359,9 +360,8 @@ describe("S2S cross-process insert-time dedupe", () => {
         const retry = yield* def.execute({ command: "msg", target: target.id, body: "fills-cap" }, ctxFor(sender.id))
         expect(retry.output).toContain("Already sent within the last 10 minutes")
       }
-      const rows = yield* store.claimForSessions([target.id])
+      const rows = yield* store.pendingForSession(target.id, Date.now())
       expect(rows).toHaveLength(1)
-      yield* store.deleteInbox(rows[0]!.id)
     }),
   )
 
@@ -396,7 +396,7 @@ describe("S2S cross-process insert-time dedupe", () => {
         timeCreated: t2,
       })
       // Two inbox rows, two distinct ids.
-      const inboxRows = yield* store.claimForSessions([target.id])
+      const inboxRows = yield* store.pendingForSession(target.id, t2)
       expect(inboxRows.map((r) => r.id).sort()).toEqual(["prune_new", "prune_old"])
     }),
   )
@@ -439,6 +439,17 @@ describe("S2S dedupe BEGIN-IMMEDIATE race across two WAL connections", () => {
       time_created INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS s2s_inbox_target ON s2s_inbox (target_session_id, drained_at);
+    CREATE TABLE IF NOT EXISTS s2s_message (
+      id TEXT PRIMARY KEY,
+      target_session_id TEXT NOT NULL,
+      from_session_id TEXT NOT NULL,
+      from_slug TEXT NOT NULL,
+      capsule TEXT NOT NULL,
+      sent_at INTEGER NOT NULL,
+      delivered_at INTEGER,
+      expired_at INTEGER,
+      superseded_at INTEGER
+    );
     CREATE TABLE IF NOT EXISTS s2s_sent (
       dedupe_key TEXT PRIMARY KEY,
       recipient_session_id TEXT NOT NULL,
@@ -466,6 +477,7 @@ describe("S2S dedupe BEGIN-IMMEDIATE race across two WAL connections", () => {
   // the previous test's state must not leak into the control race.
   const resetTables = () => {
     conn1.exec("DELETE FROM s2s_inbox")
+    conn1.exec("DELETE FROM s2s_message")
     conn1.exec("DELETE FROM s2s_sent")
   }
 
@@ -497,14 +509,14 @@ describe("S2S dedupe BEGIN-IMMEDIATE race across two WAL connections", () => {
           return { result: "duplicate", originalInboxId: existing.inbox_id ?? capsuleId }
         }
         const count = conn
-          .query("SELECT COUNT(*) AS n FROM s2s_inbox WHERE target_session_id = ? AND drained_at IS NULL")
-          .get("ses_wal_race_target") as { n: number }
+          .query("SELECT (SELECT COUNT(*) FROM s2s_inbox WHERE target_session_id = ? AND drained_at IS NULL) + (SELECT COUNT(*) FROM s2s_message WHERE target_session_id = ? AND delivered_at IS NULL AND expired_at IS NULL AND superseded_at IS NULL) AS n")
+          .get("ses_wal_race_target", "ses_wal_race_target") as { n: number }
         if (count.n >= 50) {
           conn.exec("rollback")
           return { result: "inbox_full" }
         }
         ;(conn.run as (sql: string, ...params: unknown[]) => unknown)(
-          "INSERT INTO s2s_inbox (id, target_session_id, from_session_id, from_slug, capsule, time_created) VALUES (?, ?, ?, ?, ?, ?)",
+          "INSERT INTO s2s_message (id, target_session_id, from_session_id, from_slug, capsule, sent_at) VALUES (?, ?, ?, ?, ?, ?)",
           capsuleId,
           "ses_wal_race_target",
           "ses_wal_race_sender",

@@ -33,38 +33,33 @@
 // base layer from `tool.test.ts` for the S2STool (which requires
 // Truncate + Agent in R).
 
-import { afterEach, describe, expect } from "bun:test"
+import { describe, expect } from "bun:test"
 import { Duration, Effect, Exit, Layer, Option } from "effect"
 import { Agent } from "../../src/agent/agent"
 import { Config } from "@/config/config"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Database } from "@opencode-ai/core/database/database"
+import { EventV2 } from "@opencode-ai/core/event"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Messaging } from "../../src/messaging"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { S2SPoller } from "../../src/s2s/poller"
 import { S2SStore } from "../../src/s2s/store"
 import { Session } from "@/session/session"
+import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionID } from "../../src/session/schema"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { testEffect, testEffectShared } from "../lib/effect"
+import { testEffect, testEffectIsolatedShared } from "../lib/effect"
 import { S2STool } from "../../src/tool/s2s"
 import { Truncate } from "../../src/tool/truncate"
 import { MessageID } from "../../src/session/schema"
 
-afterEach(async () => {
-  delete process.env["OPENCODE_S2S_POLL_MS"]
-  delete process.env["OPENCODE_S2S_REAP_WINDOW_MS"]
-})
-
 const database = Database.layerFromPath(":memory:")
-
-process.env["OPENCODE_S2S_POLL_MS"] = "60000"
-process.env["OPENCODE_S2S_REAP_WINDOW_MS"] = "60000"
 
 // Shared EventV2Bridge for the seam-1 layer (the subscriber forks
 // against this instance; the test publishes through it directly).
-const eventBridge = EventV2Bridge.defaultLayer.pipe(Layer.provide(database))
+const eventBridge = EventV2Bridge.defaultLayer.pipe(Layer.provideMerge(EventV2.layerWith()), Layer.provide(database))
 
 // ---------------------------------------------------------------------------
 // Seam 1 — minimal layer (no Session.defaultLayer, no Truncate/Agent)
@@ -82,7 +77,7 @@ const seam1Layer = Layer.provideMerge(
   Layer.mergeAll(messaging, eventBridge, S2SStore.defaultLayer, flagsOn),
 ).pipe(Layer.provide(database)) as Layer.Layer<unknown, never, never>
 
-const it = testEffectShared(seam1Layer)
+const it = testEffectIsolatedShared(seam1Layer)
 
 describe("S2S lifecycle: Seam 1 (Created-event auto-register)", () => {
   // The seam-1 subscriber (poller.ts:236-262) subscribes to
@@ -130,18 +125,23 @@ describe("S2S lifecycle: Seam 1 (Created-event auto-register)", () => {
 // durable s2s_allow row checked via store.isAllowed (no slug, no
 // in-process registration needed).
 
-const seam3Layer = Layer.mergeAll(
-  EventV2Bridge.defaultLayer,
-  Agent.defaultLayer,
-  Config.defaultLayer,
-  CrossSpawnSpawner.defaultLayer,
-  Session.defaultLayer,
-  Truncate.defaultLayer,
-  Messaging.defaultLayer,
-  S2SStore.defaultLayer,
-).pipe(Layer.provide(database))
+const seam3Layer = LayerNode.compile(
+  LayerNode.group([
+    Database.node,
+    Session.node,
+    SessionProjector.node,
+    EventV2Bridge.node,
+    Config.node,
+    S2SStore.node,
+    Messaging.node,
+    Agent.node,
+    CrossSpawnSpawner.node,
+    Truncate.node,
+  ]),
+  [[Database.node, database], [RuntimeFlags.node, flagsOn]],
+)
 
-const itSeam3 = testEffectShared(seam3Layer as unknown as Layer.Layer<any, any, never>)
+const itSeam3 = testEffectIsolatedShared(seam3Layer as unknown as Layer.Layer<any, any, never>)
 
 const ctxFor = (sessionID: SessionID) => ({
   sessionID,
@@ -173,9 +173,9 @@ describe("S2S lifecycle: Seam 3 (consent-scoped cross-process delivery by sessio
           { command: "msg", target: peer.id, body: "hello from seam-3" },
           ctxFor(me.id),
         )
-        expect(result.output).toContain("Persisted to s2s_inbox")
+        expect(result.output).toContain("Persisted to s2s_message")
 
-        const rows = yield* store.claimForSessions([peer.id])
+        const rows = yield* store.pendingForSession(peer.id, Date.now())
         expect(rows).toHaveLength(1)
       }),
   )
