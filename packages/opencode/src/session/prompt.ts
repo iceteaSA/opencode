@@ -1131,17 +1131,32 @@ export const layer = Layer.effect(
       yield* revert.cleanup(session)
       const message = yield* createUserMessage(input)
       yield* sessions.touch(input.sessionID)
-      // The process that persists a human user message owns its s2s mail;
-      // a later loop wake can originate elsewhere and cannot establish ownership.
-      if (flags.experimentalS2S && (message.info.origin === "operator" || (message.info.origin === undefined && !Marker.isMachineGeneratedUser(message.parts)))) {
-        yield* messaging.registerLocal(input.sessionID, message.info.id).pipe(
+      // A machine-started top-level session may serve its own mail only if a
+      // fresh owner elsewhere has not already claimed it.
+      if (flags.experimentalS2S && (!session.parentID || message.info.origin === "operator")) {
+        yield* Effect.gen(function* () {
+          const operator =
+            message.info.origin === "operator" ||
+            (message.info.origin === undefined && !Marker.isMachineGeneratedUser(message.parts))
+          const store = yield* Effect.serviceOption(S2SStore.Service)
+          if (operator) {
+            yield* messaging.registerLocal(input.sessionID, message.info.id, undefined, message.info.time.created)
+            if (Option.isSome(store))
+              yield* store.value.heartbeat(input.sessionID, S2SStore.PROCESS_OWNER_ID, Date.now())
+            return
+          }
+          // A machine turn must not demote an operator claim or move its handover fence.
+          if ((yield* messaging.isLocal(input.sessionID)) && !(yield* messaging.isMachineLocal(input.sessionID))) return
+          if (
+            Option.isSome(store) &&
+            (yield* store.value.claimPresence(input.sessionID, S2SStore.PROCESS_OWNER_ID, Date.now()))
+          ) {
+            yield* messaging.registerLocal(input.sessionID, message.info.id, "machine", message.info.time.created)
+          }
+        }).pipe(
           Effect.catchCause((cause) =>
             Effect.logWarning("s2s registration failed", { sessionID: input.sessionID, cause: Cause.pretty(cause) }),
           ),
-        )
-        const store = yield* Effect.serviceOption(S2SStore.Service)
-        if (Option.isSome(store)) yield* store.value.heartbeat(input.sessionID, S2SStore.PROCESS_OWNER_ID, Date.now()).pipe(
-          Effect.catchCause((cause) => Effect.logWarning("s2s presence update failed", { sessionID: input.sessionID, cause: Cause.pretty(cause) })),
         )
       }
 

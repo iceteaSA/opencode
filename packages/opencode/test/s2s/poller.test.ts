@@ -30,7 +30,7 @@
 // on top so the poller has a real in-memory SQLite (Database.layerFromPath)
 // to read/write against.
 
-import { EffectFlock } from '@opencode-ai/core/util/effect-flock';
+import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { afterEach, describe, expect } from "bun:test"
 import { Duration, Effect, Layer, Option } from "effect"
 import { sql } from "drizzle-orm"
@@ -74,6 +74,7 @@ import { Session } from "@/session/session"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionCompaction } from "@/session/compaction"
 import { SessionID } from "../../src/session/schema"
+import { MessageID } from "../../src/session/schema"
 import { SessionProcessor } from "@/session/processor"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionRevert } from "@/session/revert"
@@ -90,8 +91,8 @@ import { Truncate } from "@/tool/truncate"
 import { TestInstance, disposeAllInstances } from "../fixture/fixture"
 import { testEffect, testEffectIsolatedShared, testEffectShared } from "../lib/effect"
 import { TestLLMServer } from "../lib/llm-server"
-import { claimLegacy } from './fixtures/legacy-claim';
-import { countUndelivered } from './fixtures/undelivered-count';
+import { claimLegacy } from "./fixtures/legacy-claim"
+import { countUndelivered } from "./fixtures/undelivered-count"
 
 afterEach(async () => {
   await disposeAllInstances()
@@ -155,8 +156,16 @@ const lspStub = Layer.succeed(
   }),
 )
 
-const statusNode = LayerNode.make({ service: SessionStatus.Service, layer: SessionStatus.layer, deps: [EventV2Bridge.node] })
-const runStateNode = LayerNode.make({ service: SessionRunState.Service, layer: SessionRunState.layer, deps: [BackgroundJob.node, statusNode, EffectFlock.node] })
+const statusNode = LayerNode.make({
+  service: SessionStatus.Service,
+  layer: SessionStatus.layer,
+  deps: [EventV2Bridge.node],
+})
+const runStateNode = LayerNode.make({
+  service: SessionRunState.Service,
+  layer: SessionRunState.layer,
+  deps: [BackgroundJob.node, statusNode, EffectFlock.node],
+})
 
 const providerRef = {
   providerID: ProviderV2.ID.make("test"),
@@ -196,11 +205,11 @@ const providerCfgFor = (url: string): Partial<ConfigV1.Info> => ({
 // resolved by this layer see the same handle.
 const database = Database.layerFromPath(":memory:")
 
-function makeRunLoopLayer() {
+function makeRunLoopLayer(experimentalS2S = false) {
   const flags = RuntimeFlags.layer({
     experimentalEventSystem: true,
     experimentalAgentMessaging: true,
-    experimentalS2S: false,
+    experimentalS2S,
   })
   const root = LayerNode.group([
     Session.node,
@@ -262,26 +271,32 @@ function makeRunLoopLayer() {
 // to the test effect's own context). Re-provide it here so the poller's
 // `yield* RuntimeFlags.Service` resolves and the S2S-off override suppresses
 // the background fork inside the poller layer.
-const pollerLayer = Layer.provideMerge(
-  Layer.provideMerge(S2SPoller.layer, S2SStore.defaultLayer),
-  Layer.mergeAll(
-    RuntimeFlags.layer({
-      experimentalEventSystem: true,
-      experimentalAgentMessaging: true,
-      experimentalS2S: false,
-    }),
-    makeRunLoopLayer(),
-  ),
-)
+const makePollerLayer = (experimentalS2S = false) =>
+  Layer.provideMerge(
+    Layer.provideMerge(S2SPoller.layer, S2SStore.defaultLayer),
+    Layer.mergeAll(
+      RuntimeFlags.layer({
+        experimentalEventSystem: true,
+        experimentalAgentMessaging: true,
+        experimentalS2S,
+      }),
+      makeRunLoopLayer(experimentalS2S),
+    ),
+  )
+const pollerLayer = makePollerLayer()
 
 const spikeLayer = Layer.mergeAll(TestLLMServer.layer, pollerLayer).pipe(Layer.provide(database))
 const it = testEffect(spikeLayer as unknown as Layer.Layer<any, any, never>)
 const isolated = testEffectIsolatedShared(spikeLayer as unknown as Layer.Layer<any, any, never>)
+const machine = testEffectIsolatedShared(
+  Layer.mergeAll(TestLLMServer.layer, makePollerLayer(true)).pipe(Layer.provide(database)) as unknown as Layer.Layer<
+    any,
+    any,
+    never
+  >,
+)
 
-const writeConfig = Effect.fn("PollerTest.writeConfig")(function* (
-  dir: string,
-  config: Partial<ConfigV1.Info>,
-) {
+const writeConfig = Effect.fn("PollerTest.writeConfig")(function* (dir: string, config: Partial<ConfigV1.Info>) {
   const fs = yield* FSUtil.Service
   yield* fs.writeWithDirs(
     path.join(dir, "opencode.json"),
@@ -346,6 +361,8 @@ describe("S2SPoller: reaper cutoff advances per tick (FIX 1 regression guard)", 
       // processed → Session/SessionStatus/SessionPrompt stubs never invoked.
       localSet: () => Effect.succeed([]),
       isLocal: () => Effect.succeed(false),
+      isMachineLocal: () => Effect.die("unexpected Messaging.isMachineLocal in reaper test"),
+      releaseMachineLocal: () => Effect.die("unexpected Messaging.releaseMachineLocal in reaper test"),
       localMessageID: () => Effect.die("unexpected Messaging.localMessageID in reaper test"),
       isLocalFor: () => Effect.die("unexpected Messaging.isLocalFor in reaper test"),
       registerLocal: () => Effect.void,
@@ -403,17 +420,21 @@ describe("S2SPoller: reaper cutoff advances per tick (FIX 1 regression guard)", 
 
   const reaperLoopIt = testEffect(makeReaperLoopLayer() as unknown as Layer.Layer<any, any, never>)
 
-  reaperLoopIt.live(
-    "background reap loop advances its cutoff each tick (frozen form leaves row claimed)",
-    () =>
-      Effect.gen(function* () {
-        const store = yield* S2SStore.Service
-        // Use a session ID that is NOT in the local set (localSet returns [],
-        // so any ID is "non-local"). The reap loop doesn't care about local-set.
-        const targetID = SessionID.make("ses_reaper_target_xxxxxxxxx")
-        const { db } = yield* Database.Service
-        yield* db.insert(ProjectTable).values({ id: "prj_test", worktree: "/tmp", sandboxes: [], time_created: 1, time_updated: 1 } as any).run().pipe(Effect.orDie)
-        yield* db.insert(SessionTable).values({
+  reaperLoopIt.live("background reap loop advances its cutoff each tick (frozen form leaves row claimed)", () =>
+    Effect.gen(function* () {
+      const store = yield* S2SStore.Service
+      // Use a session ID that is NOT in the local set (localSet returns [],
+      // so any ID is "non-local"). The reap loop doesn't care about local-set.
+      const targetID = SessionID.make("ses_reaper_target_xxxxxxxxx")
+      const { db } = yield* Database.Service
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: "prj_test", worktree: "/tmp", sandboxes: [], time_created: 1, time_updated: 1 } as any)
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(SessionTable)
+        .values({
           id: targetID,
           project_id: "prj_test",
           slug: "test-slug",
@@ -428,39 +449,311 @@ describe("S2SPoller: reaper cutoff advances per tick (FIX 1 regression guard)", 
           tokens_cache_write: 0,
           time_created: 1,
           time_updated: 1,
-        } as any).run().pipe(Effect.orDie)
+        } as any)
+        .run()
+        .pipe(Effect.orDie)
 
-        yield* store.insertInbox({
-          id: "inb_reaper_cutoff_1",
-          targetSessionID: targetID,
-          fromSessionID: SessionID.make("ses_reaper_sender_xxxxxxxxx"),
-          fromSlug: "reaper-peer",
-          capsule: capsule("REAPER-CUTOFF-PAYLOAD"),
-          timeCreated: 1,
-        })
+      yield* store.insertInbox({
+        id: "inb_reaper_cutoff_1",
+        targetSessionID: targetID,
+        fromSessionID: SessionID.make("ses_reaper_sender_xxxxxxxxx"),
+        fromSlug: "reaper-peer",
+        capsule: capsule("REAPER-CUTOFF-PAYLOAD"),
+        timeCreated: 1,
+      })
 
-        // Claim the row so drained_at = Date.now() at this moment.
-        const claimed = yield* claimLegacy([targetID])
-        expect(claimed.map((r) => r.id)).toEqual(["inb_reaper_cutoff_1"])
+      // Claim the row so drained_at = Date.now() at this moment.
+      const claimed = yield* claimLegacy([targetID])
+      expect(claimed.map((r) => r.id)).toEqual(["inb_reaper_cutoff_1"])
 
-        // Wait 30ms — well beyond the 5ms reap window. The background loop
-        // fires every 5ms. With a fresh Date.now() each tick:
-        //   olderThan = Date.now() - 5
-        // After 10ms from the claim: olderThan = T_claim + 10 - 5 = T_claim + 5 > T_claim
-        // → row IS reaped (drained_at = T_claim < olderThan = T_claim + 5).
-        //
-        // With a FROZEN Date.now() (the bug): olderThan = T_construction - 5 < T_claim
-        // → row is NEVER reaped (drained_at = T_claim > olderThan always).
-        yield* Effect.sleep(Duration.millis(30))
+      // Wait 30ms — well beyond the 5ms reap window. The background loop
+      // fires every 5ms. With a fresh Date.now() each tick:
+      //   olderThan = Date.now() - 5
+      // After 10ms from the claim: olderThan = T_claim + 10 - 5 = T_claim + 5 > T_claim
+      // → row IS reaped (drained_at = T_claim < olderThan = T_claim + 5).
+      //
+      // With a FROZEN Date.now() (the bug): olderThan = T_construction - 5 < T_claim
+      // → row is NEVER reaped (drained_at = T_claim > olderThan always).
+      yield* Effect.sleep(Duration.millis(30))
 
-        // After 30ms the row must be reclaimable (reaper reset drained_at to NULL).
-        const reclaimed = yield* claimLegacy([targetID])
-        expect(reclaimed.map((r) => r.id)).toEqual(["inb_reaper_cutoff_1"])
-      }),
+      // After 30ms the row must be reclaimable (reaper reset drained_at to NULL).
+      const reclaimed = yield* claimLegacy([targetID])
+      expect(reclaimed.map((r) => r.id)).toEqual(["inb_reaper_cutoff_1"])
+    }),
   )
 })
 
 describe("S2SPoller: per-process wake loop (Task 5)", () => {
+  machine.instance(
+    "machine-started idle session receives durable mail and runs a provider turn",
+    () =>
+      Effect.gen(function* () {
+        const { llm } = yield* useServerConfig(providerCfgFor)
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const messaging = yield* Messaging.Service
+        const poller = yield* S2SPoller.Service
+        const { db } = yield* Database.Service
+        const chat = yield* sessions.create({
+          title: "machine-started target",
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        })
+        const sender = yield* sessions.create({ title: "machine mail sender" })
+        yield* prompt.prompt({
+          sessionID: chat.id,
+          agent: "build",
+          noReply: true,
+          parts: [{ type: "text", text: "[lane start]", synthetic: true }],
+        })
+        expect(yield* messaging.isLocal(chat.id)).toBe(true)
+        yield* llm.text("woke from mail")
+        const id = "inb_machine_started"
+        yield* db.run(sql`INSERT INTO s2s_message (id, target_session_id, from_session_id, from_slug, capsule, sent_at)
+        VALUES (${id}, ${chat.id}, ${sender.id}, 'sender', ${capsule("MACHINE-MAIL")}, ${Date.now()})`)
+        yield* poller.pollOnce()
+        expect(
+          yield* db.get(sql`SELECT delivered_at IS NOT NULL AS delivered FROM s2s_message WHERE id = ${id}`),
+        ).toEqual({ delivered: 1 })
+        const messages = yield* sessions.messages({ sessionID: chat.id })
+        expect(
+          messages.some(
+            (message) =>
+              message.info.role === "user" &&
+              message.info.origin === "s2s" &&
+              JSON.stringify(message.parts).includes("MACHINE-MAIL"),
+          ),
+        ).toBe(true)
+        expect(
+          messages.some(
+            (message) => message.info.role === "assistant" && JSON.stringify(message.parts).includes("woke from mail"),
+          ),
+        ).toBe(true)
+      }),
+    30000,
+  )
+  machine.instance("machine prompt does not steal a fresh foreign presence", () =>
+    Effect.gen(function* () {
+      yield* useServerConfig(providerCfgFor)
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const store = yield* S2SStore.Service
+      const messaging = yield* Messaging.Service
+      const poller = yield* S2SPoller.Service
+      const { db } = yield* Database.Service
+      const chat = yield* sessions.create({ title: "foreign owner" })
+      const sender = yield* sessions.create({ title: "foreign mail sender" })
+      yield* store.heartbeat(chat.id, "foreign-owner", Date.now())
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "[lane start]", synthetic: true }],
+      })
+      expect(yield* messaging.isLocal(chat.id)).toBe(false)
+      yield* db.run(sql`INSERT INTO s2s_message (id, target_session_id, from_session_id, from_slug, capsule, sent_at)
+        VALUES ('inb_foreign_owner', ${chat.id}, ${sender.id}, 'sender', ${capsule("FOREIGN-MAIL")}, ${Date.now()})`)
+      yield* poller.pollOnce()
+      expect(
+        yield* db.get(
+          sql`SELECT delivered_at, owner_id FROM s2s_message JOIN s2s_presence ON s2s_presence.session_id = target_session_id WHERE s2s_message.id = 'inb_foreign_owner'`,
+        ),
+      ).toEqual({ delivered_at: null, owner_id: "foreign-owner" })
+    }),
+  )
+  machine.instance("machine heartbeat yields when a different owner takes over before the next tick", () =>
+    Effect.gen(function* () {
+      yield* useServerConfig(providerCfgFor)
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const store = yield* S2SStore.Service
+      const messaging = yield* Messaging.Service
+      const poller = yield* S2SPoller.Service
+      const { db } = yield* Database.Service
+      const chat = yield* sessions.create({ title: "foreign takeover" })
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "[lane start]", synthetic: true }],
+      })
+      expect(yield* messaging.isLocal(chat.id)).toBe(true)
+      yield* store.heartbeat(chat.id, "foreign-owner", Date.now())
+      yield* poller.pollOnce()
+      expect(yield* messaging.isLocal(chat.id)).toBe(false)
+      expect(yield* db.get(sql`SELECT owner_id FROM s2s_presence WHERE session_id = ${chat.id}`)).toEqual({
+        owner_id: "foreign-owner",
+      })
+    }),
+  )
+  machine.instance("machine claim yields to a later operator prompt in another process", () =>
+    Effect.gen(function* () {
+      yield* useServerConfig(providerCfgFor)
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const messaging = yield* Messaging.Service
+      const store = yield* S2SStore.Service
+      const poller = yield* S2SPoller.Service
+      const { db } = yield* Database.Service
+      const chat = yield* sessions.create({ title: "operator handover" })
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "[lane start]", synthetic: true }],
+      })
+      expect(yield* messaging.isLocal(chat.id)).toBe(true)
+      yield* sessions.updateMessage({
+        id: MessageID.ascending(),
+        sessionID: chat.id,
+        role: "user",
+        origin: "operator",
+        agent: "build",
+        model: providerRef,
+        time: { created: Date.now() },
+      })
+      yield* store.heartbeat(chat.id, "new-operator", Date.now() + 1)
+      yield* poller.pollOnce()
+      expect(yield* messaging.isLocal(chat.id)).toBe(false)
+      expect(yield* db.get(sql`SELECT owner_id FROM s2s_presence WHERE session_id = ${chat.id}`)).toEqual({
+        owner_id: "new-operator",
+      })
+    }),
+  )
+  machine.instance("operator prompt takes fresh foreign presence before any poll tick", () =>
+    Effect.gen(function* () {
+      yield* useServerConfig(providerCfgFor)
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const store = yield* S2SStore.Service
+      const { db } = yield* Database.Service
+      const chat = yield* sessions.create({ title: "operator immediate takeover" })
+      yield* store.heartbeat(chat.id, "foreign-owner", Date.now())
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "real operator" }],
+      })
+      expect(yield* db.get(sql`SELECT owner_id FROM s2s_presence WHERE session_id = ${chat.id}`)).toEqual({
+        owner_id: S2SStore.PROCESS_OWNER_ID,
+      })
+    }),
+  )
+  machine.instance("machine claim replaces a stale foreign presence", () =>
+    Effect.gen(function* () {
+      yield* useServerConfig(providerCfgFor)
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const store = yield* S2SStore.Service
+      const messaging = yield* Messaging.Service
+      const { db } = yield* Database.Service
+      const chat = yield* sessions.create({ title: "stale owner" })
+      yield* store.heartbeat(chat.id, "stale-owner", Date.now() - S2SStore.PRESENCE_TTL_MS - 1)
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "[lane start]", synthetic: true }],
+      })
+      expect(yield* messaging.isLocal(chat.id)).toBe(true)
+      expect(yield* db.get(sql`SELECT owner_id FROM s2s_presence WHERE session_id = ${chat.id}`)).toEqual({
+        owner_id: S2SStore.PROCESS_OWNER_ID,
+      })
+    }),
+  )
+  machine.instance("subagent machine prompts do not register ownership", () =>
+    Effect.gen(function* () {
+      yield* useServerConfig(providerCfgFor)
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const messaging = yield* Messaging.Service
+      const { db } = yield* Database.Service
+      const parent = yield* sessions.create({ title: "parent" })
+      const child = yield* sessions.create({ title: "child", parentID: parent.id })
+      yield* prompt.prompt({
+        sessionID: child.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "[lane start]", synthetic: true }],
+      })
+      expect(yield* messaging.isLocal(child.id)).toBe(false)
+      expect(yield* db.get(sql`SELECT owner_id FROM s2s_presence WHERE session_id = ${child.id}`)).toBeUndefined()
+    }),
+  )
+  machine.instance("machine claim after an older operator prompt remains local on the next tick", () =>
+    Effect.gen(function* () {
+      yield* useServerConfig(providerCfgFor)
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const messaging = yield* Messaging.Service
+      const poller = yield* S2SPoller.Service
+      const chat = yield* sessions.create({ title: "older operator" })
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "operator" }],
+      })
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "[lane start]", synthetic: true }],
+      })
+      yield* poller.pollOnce()
+      expect(yield* messaging.isLocal(chat.id)).toBe(true)
+    }),
+  )
+  machine.instance("machine turn preserves this process's operator registration and message id", () =>
+    Effect.gen(function* () {
+      yield* useServerConfig(providerCfgFor)
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const messaging = yield* Messaging.Service
+      const chat = yield* sessions.create({ title: "operator then machine" })
+      const operator = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "operator" }],
+      })
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "[lane start]", synthetic: true }],
+      })
+      expect(yield* messaging.isMachineLocal(chat.id)).toBe(false)
+      expect(yield* messaging.localMessageID(chat.id)).toBe(operator.info.id)
+    }),
+  )
+  machine.instance("machine claim survives an older imported operator with a nonmonotonic message id", () =>
+    Effect.gen(function* () {
+      yield* useServerConfig(providerCfgFor)
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const messaging = yield* Messaging.Service
+      const poller = yield* S2SPoller.Service
+      const chat = yield* sessions.create({ title: "imported operator" })
+      yield* sessions.updateMessage({
+        id: MessageID.make("msg_z_imported"),
+        sessionID: chat.id,
+        role: "user",
+        origin: "operator",
+        agent: "build",
+        model: providerRef,
+        time: { created: Date.now() - 60_000 },
+      })
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "[lane start]", synthetic: true }],
+      })
+      yield* poller.pollOnce()
+      expect(yield* messaging.isLocal(chat.id)).toBe(true)
+    }),
+  )
   it.instance("does not claim pending mail after a newer human turn in another process", () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(providerCfgFor)
@@ -595,7 +888,7 @@ describe("S2SPoller: per-process wake loop (Task 5)", () => {
         yield* poller.pollOnce()
 
         // (5) Inbox is empty after the loop drained it.
-        expect((yield* messaging.drain(chat.id))).toEqual([])
+        expect(yield* messaging.drain(chat.id)).toEqual([])
 
         // (6) The transcript gained a user message from the drain. The
         //     non-synthetic s2s inbox marker shows the sender NAME (falls back
@@ -603,12 +896,14 @@ describe("S2SPoller: per-process wake loop (Task 5)", () => {
         //     AND the addressable sender session id, so the recipient knows who
         //     to message back, plus the body.
         const messages = yield* sessions.messages({ sessionID: chat.id })
-        const inboxMarkers = messages.flatMap((m) => m.parts).filter(
-          (p) =>
-            p.type === "text" &&
-            p.synthetic === false &&
-            (p.metadata as { marker?: { kind?: string } } | undefined)?.marker?.kind === "inbox",
-        )
+        const inboxMarkers = messages
+          .flatMap((m) => m.parts)
+          .filter(
+            (p) =>
+              p.type === "text" &&
+              p.synthetic === false &&
+              (p.metadata as { marker?: { kind?: string } } | undefined)?.marker?.kind === "inbox",
+          )
         expect(inboxMarkers.length).toBeGreaterThanOrEqual(1)
         const marker = inboxMarkers[0]!
         if (marker.type !== "text") throw new Error("unreachable: type narrowed above")
@@ -625,169 +920,23 @@ describe("S2SPoller: per-process wake loop (Task 5)", () => {
         yield* poller.pollOnce()
         // The inbox is still empty (we already drained, the second pollOnce
         // found no rows to claim).
-        expect((yield* messaging.drain(chat.id))).toEqual([])
+        expect(yield* messaging.drain(chat.id)).toEqual([])
         expect(yield* countUndelivered(chat.id)).toBe(0)
       }),
   )
 
   it.instance(
     "pollOnce receipts canonical mail before waking an idle recipient",
-    () => Effect.gen(function* () {
-      const { llm } = yield* useServerConfig(providerCfgFor)
-      const prompt = yield* SessionPrompt.Service
-      const sessions = yield* Session.Service
-      const messaging = yield* Messaging.Service
-      const poller = yield* S2SPoller.Service
-      const { db } = yield* Database.Service
-      const chat = yield* sessions.create({ title: "canonical target", permission: [{ permission: "*", pattern: "*", action: "allow" }] })
-      yield* prompt.prompt({ sessionID: chat.id, agent: "build", noReply: true, parts: [{ type: "text", text: "warm-up" }] })
-      yield* llm.text("received")
-      yield* messaging.registerLocal(chat.id)
-      const id = "inb_poller_canonical"
-      yield* db.run(sql`
-        INSERT INTO s2s_message (id, target_session_id, from_session_id, from_slug, capsule, sent_at)
-        VALUES (${id}, ${chat.id}, 'ses_poller_sender', 'sender', ${capsule("CANONICAL-PAYLOAD")}, 1)
-      `)
-      yield* poller.pollOnce()
-      const receipts = (yield* sessions.messages({ sessionID: chat.id })).filter((message) => message.info.role === "user" && message.info.origin === "s2s")
-      expect(receipts).toHaveLength(1)
-      expect(receipts[0]?.parts).toHaveLength(2)
-      expect(yield* db.get(sql`SELECT transcript_message_id FROM s2s_message WHERE id = ${id} AND delivered_at IS NOT NULL`)).toEqual({ transcript_message_id: receipts[0]?.info.id })
-      yield* poller.pollOnce()
-      expect((yield* sessions.messages({ sessionID: chat.id })).filter((message) => message.info.role === "user" && message.info.origin === "s2s")).toHaveLength(1)
-    }),
-    30000,
-  )
-
-  isolated.instance(
-    "pollOnce writes one expired summary and never renders either original instruction",
-    () => Effect.gen(function* () {
-      const { llm } = yield* useServerConfig(providerCfgFor)
-      const prompt = yield* SessionPrompt.Service
-      const sessions = yield* Session.Service
-      const messaging = yield* Messaging.Service
-      const poller = yield* S2SPoller.Service
-      const { db } = yield* Database.Service
-      const chat = yield* sessions.create({ title: "expired target", permission: [{ permission: "*", pattern: "*", action: "allow" }] })
-      yield* prompt.prompt({ sessionID: chat.id, agent: "build", noReply: true, parts: [{ type: "text", text: "warm-up" }] })
-      yield* llm.text("noticed expiry")
-      yield* messaging.registerLocal(chat.id)
-      for (const id of ["caps_poller_expired_one", "caps_poller_expired_two"]) {
-        yield* db.run(sql`
-          INSERT INTO s2s_message (id, target_session_id, from_session_id, from_slug, capsule, sent_at, expires_at)
-          VALUES (${id}, ${chat.id}, 'ses_poller_sender', 'sender', ${capsule(`DO NOT SHOW ${id}`)}, ${Date.now() - 60_000}, ${Date.now() - 1})
-        `)
-      }
-      yield* poller.pollOnce()
-      const receipts = (yield* sessions.messages({ sessionID: chat.id })).filter((message) => message.info.role === "user" && message.info.origin === "s2s")
-      expect(receipts).toHaveLength(1)
-      expect(receipts[0]?.parts).toHaveLength(1)
-      expect(receipts[0]?.parts[0]).toMatchObject({ type: "text", text: expect.stringContaining("2 expired") })
-      expect(JSON.stringify(receipts)).not.toContain("DO NOT SHOW")
-      expect(yield* db.get(sql`SELECT count(*) AS n FROM s2s_message WHERE target_session_id = ${chat.id} AND expired_at IS NOT NULL AND delivered_at IS NULL`)).toEqual({ n: 2 })
-      yield* poller.pollOnce()
-      expect((yield* sessions.messages({ sessionID: chat.id })).filter((message) => message.info.role === "user" && message.info.origin === "s2s")).toHaveLength(1)
-    }),
-    30000,
-  )
-
-  isolated.instance(
-    "pollOnce ignores future mail, then wakes after that mail becomes due",
-    () => Effect.gen(function* () {
-      const { llm } = yield* useServerConfig(providerCfgFor)
-      const prompt = yield* SessionPrompt.Service
-      const sessions = yield* Session.Service
-      const messaging = yield* Messaging.Service
-      const poller = yield* S2SPoller.Service
-      const { db } = yield* Database.Service
-      const chat = yield* sessions.create({ title: "scheduled target", permission: [{ permission: "*", pattern: "*", action: "allow" }] })
-      yield* prompt.prompt({ sessionID: chat.id, agent: "build", noReply: true, parts: [{ type: "text", text: "warm-up" }] })
-      yield* llm.text("noticed scheduled mail")
-      yield* messaging.registerLocal(chat.id)
-      const id = "caps_poller_future"
-      yield* db.run(sql`INSERT INTO s2s_message (id, target_session_id, from_session_id, from_slug, capsule, sent_at, deliver_at)
-        VALUES (${id}, ${chat.id}, 'ses_poller_sender', 'sender', ${capsule("schedule-only body")}, ${Date.now()}, ${Date.now() + 120_000})`)
-
-      yield* poller.pollOnce()
-      expect((yield* sessions.messages({ sessionID: chat.id })).filter((message) => message.info.role === "user" && message.info.origin === "s2s")).toHaveLength(0)
-      expect(yield* db.get(sql`SELECT delivered_at FROM s2s_message WHERE id = ${id}`)).toEqual({ delivered_at: null })
-
-      yield* db.run(sql`UPDATE s2s_message SET deliver_at = ${Date.now() - 1} WHERE id = ${id}`)
-      yield* poller.pollOnce()
-      const delivered = (yield* sessions.messages({ sessionID: chat.id })).filter((message) => message.info.role === "user" && message.info.origin === "s2s")
-      expect(delivered).toHaveLength(1)
-      expect(JSON.stringify(delivered)).toContain("schedule-only body")
-      expect(yield* db.get(sql`SELECT delivered_at IS NOT NULL AS delivered FROM s2s_message WHERE id = ${id}`)).toEqual({ delivered: 1 })
-    }),
-    30000,
-  )
-
-  it.instance(
-    "pollOnce leaves a row unclaimed when the target is not in this process's local-set",
-    () =>
-      Effect.gen(function* () {
-        const sessions = yield* Session.Service
-        const messaging = yield* Messaging.Service
-        const store = yield* S2SStore.Service
-        const poller = yield* S2SPoller.Service
-
-        // Seed a real local session so the poller's localSet() is non-empty
-        // (otherwise the claimForSessions call would return [] simply
-        // because the SQL WHERE clause matched nothing). This is a
-        // sanity-belt, not the test target.
-        const dummy = yield* sessions.create({
-          title: "local dummy",
-          permission: [{ permission: "*", pattern: "*", action: "allow" }],
-        })
-        yield* messaging.registerLocal(dummy.id)
-
-        // Target a session ID that is NOT in the local set. The poller will
-        // pass [dummy.id, ...others] to claimForSessions, but this row's
-        // target_session_id is not in that list — so the WHERE filter drops
-        // it and the row stays with drained_at = NULL.
-        const remote = SessionID.make("ses_remote_target_xxxxxxxxxx")
-        yield* store.insertInbox({
-          id: "inb_poller_remote",
-          targetSessionID: remote,
-          fromSessionID: SessionID.make("ses_remote_sender_xxxxxxxxxx"),
-          fromSlug: "remote-peer",
-          capsule: capsule("REMOTE-PAYLOAD"),
-          timeCreated: 1,
-        })
-
-        // The poller should not throw and should not enqueue anything for
-        // the remote target.
-        yield* poller.pollOnce()
-
-        // No inbox entry was created for `remote` (we never registered a
-        // slug for it, and the poller didn't claim the row anyway).
-        const remoteInbox = yield* messaging.drain(remote)
-        expect(remoteInbox).toEqual([])
-
-        // The row is still claimable: a direct claimForSessions on the
-        // target ID (the SQL the poller WOULD have run if the target were
-        // local) returns nothing because the ID is not in the local set,
-        // but a claimForSessions with the remote target included returns
-        // the row — proving the poller left it unclaimed.
-        const otherClaimed = yield* claimLegacy([remote])
-        expect(otherClaimed.map((r) => r.id)).toEqual(["inb_poller_remote"])
-      }),
-  )
-
-  it.instance(
-    "a delivered row is deleted and is NOT redelivered after a reap (M2 regression)",
     () =>
       Effect.gen(function* () {
         const { llm } = yield* useServerConfig(providerCfgFor)
         const prompt = yield* SessionPrompt.Service
         const sessions = yield* Session.Service
         const messaging = yield* Messaging.Service
-        const store = yield* S2SStore.Service
         const poller = yield* S2SPoller.Service
-
-        // Seed a local idle session — same harness as the first case.
+        const { db } = yield* Database.Service
         const chat = yield* sessions.create({
-          title: "Reap target",
+          title: "canonical target",
           permission: [{ permission: "*", pattern: "*", action: "allow" }],
         })
         yield* prompt.prompt({
@@ -796,62 +945,261 @@ describe("S2SPoller: per-process wake loop (Task 5)", () => {
           noReply: true,
           parts: [{ type: "text", text: "warm-up" }],
         })
-        yield* llm.text("first-wake-reply")
+        yield* llm.text("received")
         yield* messaging.registerLocal(chat.id)
-        yield* messaging.registerSlug("reap-target", chat.id)
-
-        // First pollOnce claims the row and (because the session is idle)
-        // wakes the loop. After that, the inbox is drained and the row's
-        // drained_at is set.
-        yield* store.insertInbox({
-          id: "inb_reap_1",
-          targetSessionID: chat.id,
-          fromSessionID: SessionID.make("ses_reap_sender_xxxxxxxxxx"),
-          fromSlug: "peer-z",
-          capsule: capsule("FIRST-PAYLOAD"),
-          timeCreated: 1,
-        })
+        const id = "inb_poller_canonical"
+        yield* db.run(sql`
+        INSERT INTO s2s_message (id, target_session_id, from_session_id, from_slug, capsule, sent_at)
+        VALUES (${id}, ${chat.id}, 'ses_poller_sender', 'sender', ${capsule("CANONICAL-PAYLOAD")}, 1)
+      `)
         yield* poller.pollOnce()
-        // First wake fired; the inbox is empty.
-        expect((yield* messaging.drain(chat.id))).toEqual([])
-
-        // Insert a NEW row and deliver it via pollOnce. processRow enqueues
-        // the body AND hard-deletes the row (the M2 fix). Before that fix the
-        // row stayed merely claimed (drained_at set), so the reaper below
-        // would resurrect it and the body would be delivered TWICE.
-        yield* store.insertInbox({
-          id: "inb_reap_2",
-          targetSessionID: chat.id,
-          fromSessionID: SessionID.make("ses_reap_sender_xxxxxxxxxx"),
-          fromSlug: "peer-z",
-          capsule: capsule("DELIVER-ONCE-PAYLOAD"),
-          timeCreated: 1,
-        })
-        yield* llm.text("deliver-once-wake-reply")
+        const receipts = (yield* sessions.messages({ sessionID: chat.id })).filter(
+          (message) => message.info.role === "user" && message.info.origin === "s2s",
+        )
+        expect(receipts).toHaveLength(1)
+        expect(receipts[0]?.parts).toHaveLength(2)
+        expect(
+          yield* db.get(
+            sql`SELECT transcript_message_id FROM s2s_message WHERE id = ${id} AND delivered_at IS NOT NULL`,
+          ),
+        ).toEqual({ transcript_message_id: receipts[0]?.info.id })
         yield* poller.pollOnce()
-        // Delivered once and drained.
-        expect((yield* messaging.drain(chat.id))).toEqual([])
-        // The row is GONE (deleted, not just claimed): no undelivered rows remain.
-        expect(yield* countUndelivered(chat.id)).toBe(0)
-
-        // Reap at a far-future cutoff. Before the M2 fix this reset the
-        // delivered row's drained_at to NULL and made it re-claimable; now the
-        // row no longer exists, so the reaper has nothing to resurrect.
-        yield* poller.reapOnce(Date.now() + 10 ** 9)
-
-        // A follow-up pollOnce finds nothing to claim — no re-delivery, no wake.
-        yield* poller.pollOnce()
-
-        // The body must appear EXACTLY ONCE in the transcript (the single
-        // legitimate delivery). A second occurrence would be the redelivery
-        // bug the reaper used to cause.
-        const messages = yield* sessions.messages({ sessionID: chat.id })
-        const deliveries = messages
-          .flatMap((m) => m.parts)
-          .filter((p) => p.type === "text" && p.synthetic === false)
-          .map((p) => (p.type === "text" ? p.text : ""))
-          .filter((t) => t.includes("DELIVER-ONCE-PAYLOAD")).length
-        expect(deliveries).toBe(1)
+        expect(
+          (yield* sessions.messages({ sessionID: chat.id })).filter(
+            (message) => message.info.role === "user" && message.info.origin === "s2s",
+          ),
+        ).toHaveLength(1)
       }),
+    30000,
+  )
+
+  isolated.instance(
+    "pollOnce writes one expired summary and never renders either original instruction",
+    () =>
+      Effect.gen(function* () {
+        const { llm } = yield* useServerConfig(providerCfgFor)
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const messaging = yield* Messaging.Service
+        const poller = yield* S2SPoller.Service
+        const { db } = yield* Database.Service
+        const chat = yield* sessions.create({
+          title: "expired target",
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        })
+        yield* prompt.prompt({
+          sessionID: chat.id,
+          agent: "build",
+          noReply: true,
+          parts: [{ type: "text", text: "warm-up" }],
+        })
+        yield* llm.text("noticed expiry")
+        yield* messaging.registerLocal(chat.id)
+        for (const id of ["caps_poller_expired_one", "caps_poller_expired_two"]) {
+          yield* db.run(sql`
+          INSERT INTO s2s_message (id, target_session_id, from_session_id, from_slug, capsule, sent_at, expires_at)
+          VALUES (${id}, ${chat.id}, 'ses_poller_sender', 'sender', ${capsule(`DO NOT SHOW ${id}`)}, ${Date.now() - 60_000}, ${Date.now() - 1})
+        `)
+        }
+        yield* poller.pollOnce()
+        const receipts = (yield* sessions.messages({ sessionID: chat.id })).filter(
+          (message) => message.info.role === "user" && message.info.origin === "s2s",
+        )
+        expect(receipts).toHaveLength(1)
+        expect(receipts[0]?.parts).toHaveLength(1)
+        expect(receipts[0]?.parts[0]).toMatchObject({ type: "text", text: expect.stringContaining("2 expired") })
+        expect(JSON.stringify(receipts)).not.toContain("DO NOT SHOW")
+        expect(
+          yield* db.get(
+            sql`SELECT count(*) AS n FROM s2s_message WHERE target_session_id = ${chat.id} AND expired_at IS NOT NULL AND delivered_at IS NULL`,
+          ),
+        ).toEqual({ n: 2 })
+        yield* poller.pollOnce()
+        expect(
+          (yield* sessions.messages({ sessionID: chat.id })).filter(
+            (message) => message.info.role === "user" && message.info.origin === "s2s",
+          ),
+        ).toHaveLength(1)
+      }),
+    30000,
+  )
+
+  isolated.instance(
+    "pollOnce ignores future mail, then wakes after that mail becomes due",
+    () =>
+      Effect.gen(function* () {
+        const { llm } = yield* useServerConfig(providerCfgFor)
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const messaging = yield* Messaging.Service
+        const poller = yield* S2SPoller.Service
+        const { db } = yield* Database.Service
+        const chat = yield* sessions.create({
+          title: "scheduled target",
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        })
+        yield* prompt.prompt({
+          sessionID: chat.id,
+          agent: "build",
+          noReply: true,
+          parts: [{ type: "text", text: "warm-up" }],
+        })
+        yield* llm.text("noticed scheduled mail")
+        yield* messaging.registerLocal(chat.id)
+        const id = "caps_poller_future"
+        yield* db.run(sql`INSERT INTO s2s_message (id, target_session_id, from_session_id, from_slug, capsule, sent_at, deliver_at)
+        VALUES (${id}, ${chat.id}, 'ses_poller_sender', 'sender', ${capsule("schedule-only body")}, ${Date.now()}, ${Date.now() + 120_000})`)
+
+        yield* poller.pollOnce()
+        expect(
+          (yield* sessions.messages({ sessionID: chat.id })).filter(
+            (message) => message.info.role === "user" && message.info.origin === "s2s",
+          ),
+        ).toHaveLength(0)
+        expect(yield* db.get(sql`SELECT delivered_at FROM s2s_message WHERE id = ${id}`)).toEqual({
+          delivered_at: null,
+        })
+
+        yield* db.run(sql`UPDATE s2s_message SET deliver_at = ${Date.now() - 1} WHERE id = ${id}`)
+        yield* poller.pollOnce()
+        const delivered = (yield* sessions.messages({ sessionID: chat.id })).filter(
+          (message) => message.info.role === "user" && message.info.origin === "s2s",
+        )
+        expect(delivered).toHaveLength(1)
+        expect(JSON.stringify(delivered)).toContain("schedule-only body")
+        expect(
+          yield* db.get(sql`SELECT delivered_at IS NOT NULL AS delivered FROM s2s_message WHERE id = ${id}`),
+        ).toEqual({ delivered: 1 })
+      }),
+    30000,
+  )
+
+  it.instance("pollOnce leaves a row unclaimed when the target is not in this process's local-set", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const messaging = yield* Messaging.Service
+      const store = yield* S2SStore.Service
+      const poller = yield* S2SPoller.Service
+
+      // Seed a real local session so the poller's localSet() is non-empty
+      // (otherwise the claimForSessions call would return [] simply
+      // because the SQL WHERE clause matched nothing). This is a
+      // sanity-belt, not the test target.
+      const dummy = yield* sessions.create({
+        title: "local dummy",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* messaging.registerLocal(dummy.id)
+
+      // Target a session ID that is NOT in the local set. The poller will
+      // pass [dummy.id, ...others] to claimForSessions, but this row's
+      // target_session_id is not in that list — so the WHERE filter drops
+      // it and the row stays with drained_at = NULL.
+      const remote = SessionID.make("ses_remote_target_xxxxxxxxxx")
+      yield* store.insertInbox({
+        id: "inb_poller_remote",
+        targetSessionID: remote,
+        fromSessionID: SessionID.make("ses_remote_sender_xxxxxxxxxx"),
+        fromSlug: "remote-peer",
+        capsule: capsule("REMOTE-PAYLOAD"),
+        timeCreated: 1,
+      })
+
+      // The poller should not throw and should not enqueue anything for
+      // the remote target.
+      yield* poller.pollOnce()
+
+      // No inbox entry was created for `remote` (we never registered a
+      // slug for it, and the poller didn't claim the row anyway).
+      const remoteInbox = yield* messaging.drain(remote)
+      expect(remoteInbox).toEqual([])
+
+      // The row is still claimable: a direct claimForSessions on the
+      // target ID (the SQL the poller WOULD have run if the target were
+      // local) returns nothing because the ID is not in the local set,
+      // but a claimForSessions with the remote target included returns
+      // the row — proving the poller left it unclaimed.
+      const otherClaimed = yield* claimLegacy([remote])
+      expect(otherClaimed.map((r) => r.id)).toEqual(["inb_poller_remote"])
+    }),
+  )
+
+  it.instance("a delivered row is deleted and is NOT redelivered after a reap (M2 regression)", () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfgFor)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const messaging = yield* Messaging.Service
+      const store = yield* S2SStore.Service
+      const poller = yield* S2SPoller.Service
+
+      // Seed a local idle session — same harness as the first case.
+      const chat = yield* sessions.create({
+        title: "Reap target",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "warm-up" }],
+      })
+      yield* llm.text("first-wake-reply")
+      yield* messaging.registerLocal(chat.id)
+      yield* messaging.registerSlug("reap-target", chat.id)
+
+      // First pollOnce claims the row and (because the session is idle)
+      // wakes the loop. After that, the inbox is drained and the row's
+      // drained_at is set.
+      yield* store.insertInbox({
+        id: "inb_reap_1",
+        targetSessionID: chat.id,
+        fromSessionID: SessionID.make("ses_reap_sender_xxxxxxxxxx"),
+        fromSlug: "peer-z",
+        capsule: capsule("FIRST-PAYLOAD"),
+        timeCreated: 1,
+      })
+      yield* poller.pollOnce()
+      // First wake fired; the inbox is empty.
+      expect(yield* messaging.drain(chat.id)).toEqual([])
+
+      // Insert a NEW row and deliver it via pollOnce. processRow enqueues
+      // the body AND hard-deletes the row (the M2 fix). Before that fix the
+      // row stayed merely claimed (drained_at set), so the reaper below
+      // would resurrect it and the body would be delivered TWICE.
+      yield* store.insertInbox({
+        id: "inb_reap_2",
+        targetSessionID: chat.id,
+        fromSessionID: SessionID.make("ses_reap_sender_xxxxxxxxxx"),
+        fromSlug: "peer-z",
+        capsule: capsule("DELIVER-ONCE-PAYLOAD"),
+        timeCreated: 1,
+      })
+      yield* llm.text("deliver-once-wake-reply")
+      yield* poller.pollOnce()
+      // Delivered once and drained.
+      expect(yield* messaging.drain(chat.id)).toEqual([])
+      // The row is GONE (deleted, not just claimed): no undelivered rows remain.
+      expect(yield* countUndelivered(chat.id)).toBe(0)
+
+      // Reap at a far-future cutoff. Before the M2 fix this reset the
+      // delivered row's drained_at to NULL and made it re-claimable; now the
+      // row no longer exists, so the reaper has nothing to resurrect.
+      yield* poller.reapOnce(Date.now() + 10 ** 9)
+
+      // A follow-up pollOnce finds nothing to claim — no re-delivery, no wake.
+      yield* poller.pollOnce()
+
+      // The body must appear EXACTLY ONCE in the transcript (the single
+      // legitimate delivery). A second occurrence would be the redelivery
+      // bug the reaper used to cause.
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const deliveries = messages
+        .flatMap((m) => m.parts)
+        .filter((p) => p.type === "text" && p.synthetic === false)
+        .map((p) => (p.type === "text" ? p.text : ""))
+        .filter((t) => t.includes("DELIVER-ONCE-PAYLOAD")).length
+      expect(deliveries).toBe(1)
+    }),
   )
 })

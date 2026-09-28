@@ -89,6 +89,8 @@ interface State {
   // Message IDs fence ownership after the person continues in another process.
   // Entries without one preserve registrations made outside SessionPrompt.prompt.
   local: Map<SessionID, MessageID | undefined>
+  localCreated: Map<SessionID, number>
+  machineLocal: Set<SessionID>
   // Wake-on-message: per-session wake budget. A session must be in this map
   // (with budget > 0) for enqueue to attempt a wake.
   wakePolicy: Map<SessionID, { budget: number }>
@@ -130,14 +132,23 @@ export interface Interface {
   }) => Effect.Effect<void, AbuseError>
   readonly drain: (sessionID: SessionID) => Effect.Effect<ReadonlyArray<InboxItem>>
   readonly awaitInbox: (sessionID: SessionID, opts: { timeoutMs: number }) => Effect.Effect<boolean>
-  readonly registerLocal: (sessionID: SessionID, messageID?: MessageID) => Effect.Effect<void>
-  readonly isLocal: (sessionID: SessionID) => Effect.Effect<boolean>
-  readonly localMessageID: (sessionID: SessionID) => Effect.Effect<MessageID | undefined>
-  readonly isLocalFor: (sessionID: SessionID, latestHumanID: MessageID) => Effect.Effect<boolean>
-  readonly localSet: () => Effect.Effect<ReadonlyArray<SessionID>>
-  readonly registerWakeHandler: (
-    handler: (sessionID: SessionID) => Effect.Effect<void>,
+  readonly registerLocal: (
+    sessionID: SessionID,
+    messageID?: MessageID,
+    kind?: "machine",
+    created?: number,
   ) => Effect.Effect<void>
+  readonly isLocal: (sessionID: SessionID) => Effect.Effect<boolean>
+  readonly isMachineLocal: (sessionID: SessionID) => Effect.Effect<boolean>
+  readonly releaseMachineLocal: (sessionID: SessionID) => Effect.Effect<void>
+  readonly localMessageID: (sessionID: SessionID) => Effect.Effect<MessageID | undefined>
+  readonly isLocalFor: (
+    sessionID: SessionID,
+    latestHumanID: MessageID,
+    latestHumanCreated?: number,
+  ) => Effect.Effect<boolean>
+  readonly localSet: () => Effect.Effect<ReadonlyArray<SessionID>>
+  readonly registerWakeHandler: (handler: (sessionID: SessionID) => Effect.Effect<void>) => Effect.Effect<void>
   readonly setWakePolicy: (input: { sessionID: SessionID; budget: number }) => Effect.Effect<void>
 }
 
@@ -166,6 +177,8 @@ export const layer = Layer.effect(
           waiters: new Map<SessionID, Deferred.Deferred<void>>(),
           treeTotal: { count: 0 },
           local: new Map<SessionID, MessageID | undefined>(),
+          localCreated: new Map<SessionID, number>(),
+          machineLocal: new Set<SessionID>(),
           wakePolicy: new Map<SessionID, { budget: number }>(),
           wakeHandler: null,
         }
@@ -184,6 +197,8 @@ export const layer = Layer.effect(
             state.waiters.clear()
             state.treeTotal.count = 0
             state.local.clear()
+            state.localCreated.clear()
+            state.machineLocal.clear()
             state.wakePolicy.clear()
             state.wakeHandler = null
           }),
@@ -427,9 +442,27 @@ export const layer = Layer.effect(
     })
 
     const registerLocal: Interface["registerLocal"] = Effect.fn("Messaging.registerLocal")(
-      function* (sessionID, messageID) {
+      function* (sessionID, messageID, kind, created) {
         const v = yield* InstanceState.get(state)
         v.local.set(sessionID, messageID)
+        if (created === undefined) v.localCreated.delete(sessionID)
+        else v.localCreated.set(sessionID, created)
+        if (kind === "machine") v.machineLocal.add(sessionID)
+        else v.machineLocal.delete(sessionID)
+      },
+    )
+
+    const isMachineLocal: Interface["isMachineLocal"] = Effect.fn("Messaging.isMachineLocal")(function* (sessionID) {
+      const v = yield* InstanceState.get(state)
+      return v.machineLocal.has(sessionID)
+    })
+
+    const releaseMachineLocal: Interface["releaseMachineLocal"] = Effect.fn("Messaging.releaseMachineLocal")(
+      function* (sessionID) {
+        const v = yield* InstanceState.get(state)
+        if (!v.machineLocal.delete(sessionID)) return
+        v.local.delete(sessionID)
+        v.localCreated.delete(sessionID)
       },
     )
 
@@ -443,33 +476,40 @@ export const layer = Layer.effect(
       return v.local.get(sessionID)
     })
 
-    const isLocalFor: Interface["isLocalFor"] = Effect.fn("Messaging.isLocalFor")(function* (sessionID, latestHumanID) {
-      const v = yield* InstanceState.get(state)
-      if (!v.local.has(sessionID)) return false
-      const recorded = v.local.get(sessionID)
-      if (recorded === undefined || recorded === latestHumanID) return true
-      v.local.delete(sessionID)
-      return false
-    })
+    const isLocalFor: Interface["isLocalFor"] = Effect.fn("Messaging.isLocalFor")(
+      function* (sessionID, latestHumanID, latestHumanCreated) {
+        const v = yield* InstanceState.get(state)
+        if (!v.local.has(sessionID)) return false
+        const recorded = v.local.get(sessionID)
+        if (recorded === undefined || recorded === latestHumanID) return true
+        const created = v.localCreated.get(sessionID)
+        // Imported and forked messages can carry timestamps older than their IDs.
+        if (created !== undefined && latestHumanCreated !== undefined) {
+          if (created > latestHumanCreated || (created === latestHumanCreated && recorded > latestHumanID)) return true
+        } else if (recorded > latestHumanID) return true
+        v.local.delete(sessionID)
+        v.localCreated.delete(sessionID)
+        v.machineLocal.delete(sessionID)
+        return false
+      },
+    )
 
     const localSet: Interface["localSet"] = Effect.fn("Messaging.localSet")(function* () {
       const v = yield* InstanceState.get(state)
       return [...v.local.keys()]
     })
 
-    const registerWakeHandler: Interface["registerWakeHandler"] = Effect.fn(
-      "Messaging.registerWakeHandler",
-    )(function* (handler) {
-      const v = yield* InstanceState.get(state)
-      v.wakeHandler = handler
-    })
-
-    const setWakePolicy: Interface["setWakePolicy"] = Effect.fn("Messaging.setWakePolicy")(
-      function* (input) {
+    const registerWakeHandler: Interface["registerWakeHandler"] = Effect.fn("Messaging.registerWakeHandler")(
+      function* (handler) {
         const v = yield* InstanceState.get(state)
-        v.wakePolicy.set(input.sessionID, { budget: input.budget })
+        v.wakeHandler = handler
       },
     )
+
+    const setWakePolicy: Interface["setWakePolicy"] = Effect.fn("Messaging.setWakePolicy")(function* (input) {
+      const v = yield* InstanceState.get(state)
+      v.wakePolicy.set(input.sessionID, { budget: input.budget })
+    })
 
     // Runs after enqueue persistence to check whether the recipient should
     // be woken. All predicate checks must hold before budget decrement and
@@ -544,6 +584,8 @@ export const layer = Layer.effect(
       awaitInbox,
       registerLocal,
       isLocal,
+      isMachineLocal,
+      releaseMachineLocal,
       localMessageID,
       isLocalFor,
       localSet,
