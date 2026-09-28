@@ -26,17 +26,20 @@ const capsule = encodeCapsule({
   body: "BOUNDED-RETRY-PAYLOAD",
 })
 
-const interceptedStore = Layer.effect(S2SStore.Service, Effect.gen(function* () {
-  const store = yield* S2SStore.Service
-  return S2SStore.Service.of({
-    ...store,
-    receipt: () => {
-      attempts++
-      if (enqueueResults.shift() === true) return Effect.succeed(true)
-      return Effect.fail(new S2SStore.S2SStoreError({ message: "deterministic test failure", cause: null }))
-    },
-  })
-})).pipe(Layer.provide(S2SStore.layer))
+const interceptedStore = Layer.effect(
+  S2SStore.Service,
+  Effect.gen(function* () {
+    const store = yield* S2SStore.Service
+    return S2SStore.Service.of({
+      ...store,
+      receipt: () => {
+        attempts++
+        if (enqueueResults.shift() === true) return Effect.succeed(true)
+        return Effect.fail(new S2SStore.S2SStoreError({ message: "deterministic test failure", cause: null }))
+      },
+    })
+  }),
+).pipe(Layer.provide(S2SStore.layer))
 
 const it = testEffectIsolatedShared(
   Layer.mergeAll(
@@ -48,10 +51,20 @@ const it = testEffectIsolatedShared(
       set: () => Effect.succeed(undefined),
     }),
     Layer.succeed(Session.Service, {
-      findMessage: () => Effect.succeed(Option.some({ info: {
-        id: "msg_retry_user", sessionID: target, role: "user", agent: "build",
-        model: { providerID: "test", modelID: "test" }, time: { created: 1 },
-      }, parts: [] })),
+      findMessage: () =>
+        Effect.succeed(
+          Option.some({
+            info: {
+              id: "msg_retry_user",
+              sessionID: target,
+              role: "user",
+              agent: "build",
+              model: { providerID: "test", modelID: "test" },
+              time: { created: 1 },
+            },
+            parts: [],
+          }),
+        ),
     } as unknown as Session.Interface),
     Layer.succeed(SessionPrompt.Service, {
       loop: () => Effect.succeed(undefined),
@@ -71,6 +84,8 @@ const it = testEffectIsolatedShared(
       awaitInbox: () => Effect.die("unexpected Messaging.awaitInbox"),
       registerLocal: () => Effect.die("unexpected Messaging.registerLocal"),
       isLocal: () => Effect.succeed(true),
+      isMachineLocal: () => Effect.succeed(false),
+      releaseMachineLocal: () => Effect.void,
       localMessageID: () => Effect.succeed(undefined),
       isLocalFor: () => Effect.die("unexpected Messaging.isLocalFor"),
       localSet: () => Effect.succeed([target]),

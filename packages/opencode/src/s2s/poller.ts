@@ -84,23 +84,34 @@ export const pollOnceImpl = Effect.fn("S2SPoller.pollOnce")(function* () {
   if (locals.length === 0) return
 
   const sessions = yield* Session.Service
-  const owned = yield* Effect.filter(locals, (sessionID) => isLocalForLatestUser(sessionID, messaging, sessions))
+  const owned = yield* Effect.filter(locals, (sessionID) =>
+    Effect.gen(function* () {
+      if (!(yield* isLocalForLatestUser(sessionID, messaging, sessions))) return false
+      if (!(yield* messaging.isMachineLocal(sessionID))) return true
+      if (yield* store.claimPresence(sessionID, S2SStore.PROCESS_OWNER_ID, Date.now())) return true
+      yield* messaging.releaseMachineLocal(sessionID)
+      return false
+    }),
+  )
   for (const sessionID of locals) {
-    if (owned.includes(sessionID)) yield* store.heartbeat(sessionID, S2SStore.PROCESS_OWNER_ID, Date.now())
-    else yield* store.clearPresence(sessionID, S2SStore.PROCESS_OWNER_ID)
+    if (!owned.includes(sessionID)) yield* store.clearPresence(sessionID, S2SStore.PROCESS_OWNER_ID)
+    else if (!(yield* messaging.isMachineLocal(sessionID)))
+      yield* store.heartbeat(sessionID, S2SStore.PROCESS_OWNER_ID, Date.now())
   }
   if (owned.length === 0) return
   const pending = yield* store.pendingTargets(owned)
   const expiries = new Map<SessionID, string[]>()
-  const rows = (yield* Effect.forEach(pending, (sessionID) => Effect.gen(function* () {
-    // A claimed legacy id belongs to its claiming process until the reaper resets it.
-    for (const legacy of yield* store.pendingLegacyForSession(sessionID)) yield* store.adoptLegacy(legacy.id)
-    const last = yield* sessions.findMessage(sessionID, (message) => message.info.role === "user")
-    if (Option.isSome(last) && last.value.info.role === "user") {
-      expiries.set(sessionID, yield* store.resolvePendingForSession(sessionID, Date.now()))
-    }
-    return yield* store.pendingForSession(sessionID, Date.now())
-  }))).flat()
+  const rows = (yield* Effect.forEach(pending, (sessionID) =>
+    Effect.gen(function* () {
+      // A claimed legacy id belongs to its claiming process until the reaper resets it.
+      for (const legacy of yield* store.pendingLegacyForSession(sessionID)) yield* store.adoptLegacy(legacy.id)
+      const last = yield* sessions.findMessage(sessionID, (message) => message.info.role === "user")
+      if (Option.isSome(last) && last.value.info.role === "user") {
+        expiries.set(sessionID, yield* store.resolvePendingForSession(sessionID, Date.now()))
+      }
+      return yield* store.pendingForSession(sessionID, Date.now())
+    }),
+  )).flat()
   const delivered = new Set<SessionID>()
   for (const row of rows) {
     // processRow is per-row; an exception in one row's wake must not
@@ -145,11 +156,15 @@ export const wakePollerLoop = (pollMs: number): Effect.Effect<void> =>
     // at warning level and let the schedule continue to the next tick.
     Effect.catchCause((cause) => Effect.logWarning("s2s wake-poller tick failed", { cause: Cause.pretty(cause) })),
     Effect.schedule(Schedule.spaced(Duration.millis(pollMs))),
-    Effect.ensuring(Effect.gen(function* () {
-      const messaging = yield* Messaging.Service
-      const store = yield* S2SStore.Service
-      for (const id of yield* messaging.localSet()) yield* store.clearPresence(id, S2SStore.PROCESS_OWNER_ID)
-    }).pipe(Effect.catchCause((cause) => Effect.logWarning("s2s presence cleanup failed", { cause: Cause.pretty(cause) })))),
+    Effect.ensuring(
+      Effect.gen(function* () {
+        const messaging = yield* Messaging.Service
+        const store = yield* S2SStore.Service
+        for (const id of yield* messaging.localSet()) yield* store.clearPresence(id, S2SStore.PROCESS_OWNER_ID)
+      }).pipe(
+        Effect.catchCause((cause) => Effect.logWarning("s2s presence cleanup failed", { cause: Cause.pretty(cause) })),
+      ),
+    ),
   ) as unknown as Effect.Effect<void>
 
 // Register into the wake-registry so SessionPrompt.loop can fork the

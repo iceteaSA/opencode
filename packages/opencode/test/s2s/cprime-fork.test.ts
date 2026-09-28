@@ -23,9 +23,10 @@
 // wakeBody() the C′ fork calls is a no-op stub until that registration runs.
 import "@/s2s/poller"
 
-import { EffectFlock } from '@opencode-ai/core/util/effect-flock';
+import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { afterAll, afterEach, beforeAll, describe, expect } from "bun:test"
 import { Effect, Layer } from "effect"
+import { sql } from "drizzle-orm"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { NodeFileSystem } from "@effect/platform-node"
 import { FetchHttpClient } from "effect/unstable/http"
@@ -77,7 +78,7 @@ import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { TestInstance, disposeAllInstances } from "../fixture/fixture"
 import { testEffectIsolatedShared } from "../lib/effect"
 import { TestLLMServer } from "../lib/llm-server"
-import { countUndelivered } from './fixtures/undelivered-count';
+import { countUndelivered } from "./fixtures/undelivered-count"
 
 afterEach(async () => {
   await disposeAllInstances()
@@ -154,8 +155,16 @@ const lspStub = Layer.succeed(
   }),
 )
 
-const statusNode = LayerNode.make({ service: SessionStatus.Service, layer: SessionStatus.layer, deps: [EventV2Bridge.node] })
-const runStateNode = LayerNode.make({ service: SessionRunState.Service, layer: SessionRunState.layer, deps: [BackgroundJob.node, statusNode, EffectFlock.node] })
+const statusNode = LayerNode.make({
+  service: SessionStatus.Service,
+  layer: SessionStatus.layer,
+  deps: [EventV2Bridge.node],
+})
+const runStateNode = LayerNode.make({
+  service: SessionRunState.Service,
+  layer: SessionRunState.layer,
+  deps: [BackgroundJob.node, statusNode, EffectFlock.node],
+})
 
 // experimentalS2S: true is the load-bearing difference from wakeup-spike — it
 // gates the C′ fork in SessionPrompt.loop.
@@ -437,14 +446,43 @@ describe("s2s local ownership follows the latest user turn", () => {
       expect(yield* messaging.localSet()).toContain(chat.id)
     }),
   )
-  it.instance("does not claim a session whose latest user turn is all synthetic or marker-tagged", () =>
+  it.instance(
+    "claims a session whose latest user turn is all synthetic or marker-tagged when no other owner holds it",
+    () =>
+      Effect.gen(function* () {
+        const { llm } = yield* useServerConfig(providerCfgFor)
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const messaging = yield* Messaging.Service
+        const chat = yield* sessions.create({ title: "injected-only turn" })
+
+        yield* prompt.prompt({
+          sessionID: chat.id,
+          agent: "build",
+          noReply: true,
+          parts: [
+            { type: "text", text: "injected", synthetic: true },
+            { type: "text", text: "notice", metadata: { marker: { kind: "inbox" } } },
+          ],
+        })
+        expect(yield* messaging.localSet()).toContain(chat.id)
+        yield* llm.text("reply")
+        yield* prompt.loop({ sessionID: chat.id })
+
+        expect(yield* messaging.localSet()).toContain(chat.id)
+      }),
+  )
+  it.instance("does not claim an injected-only turn while another owner holds a fresh presence row", () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(providerCfgFor)
       const prompt = yield* SessionPrompt.Service
       const sessions = yield* Session.Service
       const messaging = yield* Messaging.Service
-      const chat = yield* sessions.create({ title: "injected-only turn" })
+      const store = yield* S2SStore.Service
+      const { db } = yield* Database.Service
+      const chat = yield* sessions.create({ title: "injected-only foreign-owned turn" })
 
+      yield* store.heartbeat(chat.id, "foreign-owner", Date.now())
       yield* prompt.prompt({
         sessionID: chat.id,
         agent: "build",
@@ -459,6 +497,9 @@ describe("s2s local ownership follows the latest user turn", () => {
       yield* prompt.loop({ sessionID: chat.id })
 
       expect(yield* messaging.localSet()).not.toContain(chat.id)
+      expect(yield* db.get(sql`SELECT owner_id FROM s2s_presence WHERE session_id = ${chat.id}`)).toEqual({
+        owner_id: "foreign-owner",
+      })
     }),
   )
 

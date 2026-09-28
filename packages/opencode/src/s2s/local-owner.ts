@@ -13,8 +13,11 @@ export const isLocalForLatestUser = Effect.fn("S2SLocalOwner.isLocalForLatestUse
   if ((yield* messaging.localMessageID(sessionID)) === undefined) return true
   const latest = yield* sessions.findMessage(
     sessionID,
-    (message) => message.info.role === "user" && (message.info.origin === "operator" || (message.info.origin === undefined && !Marker.isMachineGeneratedUser(message.parts))),
+    (message) =>
+      message.info.role === "user" &&
+      (message.info.origin === "operator" ||
+        (message.info.origin === undefined && !Marker.isMachineGeneratedUser(message.parts))),
   )
   if (Option.isNone(latest)) return true
-  return yield* messaging.isLocalFor(sessionID, latest.value.info.id)
+  return yield* messaging.isLocalFor(sessionID, latest.value.info.id, latest.value.info.time.created)
 })
