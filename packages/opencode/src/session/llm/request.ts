@@ -165,7 +165,10 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
     params,
     messageTransformOptions: options,
     headers: {
-      "x-opencode-session-id": input.sessionID,
+      // The Zen gateway refuses a request whose x-opencode-session-id is present and differs from x-opencode-session.
+      "x-opencode-session-id": input.model.providerID.startsWith("opencode")
+        ? zenSessionID(input.sessionID)
+        : input.sessionID,
       ...(input.parentSessionID ? { "x-opencode-parent-session-id": input.parentSessionID } : {}),
       ...(input.model.providerID.startsWith("opencode")
         ? {
