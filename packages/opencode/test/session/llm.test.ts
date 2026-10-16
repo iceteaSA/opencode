@@ -756,6 +756,92 @@ describe("session.llm.stream", () => {
   const vivgridFixture = { providerID: "vivgrid", modelID: "gemini-3.1-pro-preview" }
   const opencodeFixture = { providerID: "opencode-test", modelID: vivgridFixture.modelID }
 
+  const headerCases = [
+    { providerID: opencodeFixture.providerID, child: false },
+    { providerID: opencodeFixture.providerID, child: true },
+    { providerID: "custom-test", child: false },
+    { providerID: "custom-test", child: true },
+  ]
+  headerCases.forEach((input) => {
+    it.instance(
+      `sends session identity headers for ${input.child ? "child" : "root"} sessions on ${input.providerID}`,
+      () =>
+        Effect.gen(function* () {
+          const fixture = loadFixture(vivgridFixture.providerID, vivgridFixture.modelID)
+          const request = waitRequest(
+            "/chat/completions",
+            new Response(createChatStream("Hello"), {
+              status: 200,
+              headers: { "Content-Type": "text/event-stream" },
+            }),
+          )
+          const resolved = yield* Provider.use.getModel(
+            ProviderV2.ID.make(input.providerID),
+            ModelV2.ID.make(opencodeFixture.modelID),
+          )
+          // Standard-shape ids: the fork normalizes any other shape for the Zen
+          // gateway, which the next test covers.
+          const sessionID = SessionID.make("ses_0123456789abAbCdEfGhIjKlMn")
+          const parentSessionID = input.child ? SessionID.make("ses_fedcba987654NmLkJiHgFeDcBa") : undefined
+          const agent = {
+            name: "test",
+            mode: "primary",
+            options: {},
+            permission: [{ permission: "*", pattern: "*", action: "allow" }],
+          } satisfies Agent.Info
+          const user = {
+            id: MessageID.make("msg_user-parent-header"),
+            sessionID,
+            role: "user",
+            time: { created: Date.now() },
+            agent: agent.name,
+            model: {
+              providerID: ProviderV2.ID.make(input.providerID),
+              modelID: resolved.id,
+            },
+          } satisfies SessionV1.User
+
+          yield* drain({
+            user,
+            sessionID,
+            parentSessionID,
+            model: resolved,
+            agent,
+            system: ["You are a helpful assistant."],
+            messages: [{ role: "user", content: "Hello" }],
+            tools: {},
+          })
+
+          const headers = (yield* Effect.promise(() => request)).headers
+          expect(headers.get("x-opencode-session-id")).toBe(sessionID)
+          expect(headers.get("x-opencode-parent-session-id")).toBe(parentSessionID ?? null)
+          expect(headers.get("x-parent-session-id")).toBe(parentSessionID ?? null)
+          if (input.providerID.startsWith("opencode")) {
+            expect(headers.get("x-opencode-session")).toBe(sessionID)
+            return
+          }
+          expect(headers.get("x-session-affinity")).toBe(sessionID)
+          expect(headers.get("X-Session-Id")).toBe(sessionID)
+        }),
+      {
+        config: () => {
+          const fixture = loadFixture(vivgridFixture.providerID, vivgridFixture.modelID)
+          return {
+            enabled_providers: [input.providerID],
+            provider: {
+              [input.providerID]: {
+                name: "OpenCode Test",
+                npm: "@ai-sdk/openai-compatible",
+                models: { [fixture.model.id]: configModel(fixture.model) as ConfigModel },
+                options: { apiKey: "test-key", baseURL: `${state.server!.url.origin}/v1` },
+              },
+            },
+          }
+        },
+      },
+    )
+  })
+
   it.instance(
     "sends standard session headers for opencode providers",
     () =>
