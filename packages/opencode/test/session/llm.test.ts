@@ -906,6 +906,10 @@ describe("session.llm.stream", () => {
         expect(sessionHeaders[1]).toBe(sessionHeaders[2])
         expect(sessionHeaders[1]).not.toBe(sessionHeaders[3])
         expect(captures[1].headers.get("x-parent-session-id")).toBe(parentSessionID)
+        // The gateway rejects a request whose x-opencode-session-id is present but differs from x-opencode-session.
+        for (const capture of captures) {
+          expect(capture.headers.get("x-opencode-session-id")).toBe(capture.headers.get("x-opencode-session"))
+        }
       }),
     {
       config: () => {
